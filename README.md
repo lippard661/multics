@@ -51,15 +51,21 @@ M), and the I/O performance using the proxy over SSH to GHM is much
 better than telnet to localhost for my system.
 
 # Individual user Aliases
+'''
 alias loginmultics='/usr/bin/telnet localhost 6180;/usr/bin/reset'
+'''
 
 # Root aliases:
+'''
 alias startmultics='/usr/bin/rcctl start multics'
 alias stopmultics='/usr/bin/perl /usr/local/bin/shutdown_multics.pl'
 alias multicscons='/usr/bin/su -s /bin/sh _multics -c "/usr/bin/tmux attach-session -t multics"'
+'''
 
 # Files in the repo:
 
+'''text
 multics:  rc.d/multics, for starting up Multics with "rcctl start multics"
 shutdown_multics.pl:  perl script to shut down Multics
+'''
 
