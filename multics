@@ -1,0 +1,26 @@
+#!/bin/ksh
+#
+# /etc/rc.d/multics
+
+# 1. Point the core daemon binary to tmux
+daemon="/usr/bin/tmux"
+
+# 2. Tell OpenBSD to natively run this daemon under your unprivileged user
+daemon_user="_multics" 
+
+# 3. Define the flags passed directly to tmux
+daemon_flags="new-session -d -s multics '/usr/local/bin/dps8 /home/_multics/MR12.8_boot.ini'"
+
+. /etc/rc.d/rc.subr
+
+# OVERRIDE THE CHECK MATCH: Tell OpenBSD to look exactly for your active boot ini flag string
+# rather than looking for a generic 'tmux' binary signature.
+pexp=".*dps8 /home/_multics/MR12.8_boot.ini"
+
+# With the above variables, OpenBSD natively manages starting it as _multics.
+# We only need to override the stop sequence for our Perl script.
+rc_stop() {
+    /usr/local/bin/shutdown_multics.pl
+}
+
+rc_cmd $1
