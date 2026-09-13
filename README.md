@@ -50,8 +50,7 @@ development system these days, the equivalent of Honeywell's System
 M), and the I/O performance using the proxy over SSH to GHM is much
 better than telnet to localhost for my system.
 
-Individual user aliases:
-# Aliases
+# Individual user Aliases
 alias loginmultics='/usr/bin/telnet localhost 6180;/usr/bin/reset'
 
 # Root aliases:
