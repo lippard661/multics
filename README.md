@@ -1,7 +1,9 @@
 # multics
 
 This repository contains files and information related to using the
-DPS8M Multics simulator on OpenBSD.
+DPS8M Multics simulator on OpenBSD. (Plus one bonus file -- a zsh
+script to support Multics abbrev syntax instead of using aliases;
+I'm currently using it on macOS.)
 
 The DPS8M simulator and information on installing it on various
 operating systems can be found here:
