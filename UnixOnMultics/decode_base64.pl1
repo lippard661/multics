@@ -1,0 +1,184 @@
+/* decode_base64  input_file  output_file
+ *
+ * Reverses encode_base64: reads a base64 transcription and
+ * writes the original bytes to output_file.  Any character that
+ * is not a base64 digit or the "=" pad is skipped, so line
+ * breaks, spaces and tabs introduced anywhere in transit are
+ * harmless -- the decoded file matches the original byte for
+ * byte (for ordinary 7-bit text).
+ *
+ * Line width is kept under 72 columns for the card reader.
+ *
+ * Written 22 September 2026 by Claude Opus 4.8 at the direction
+ * of Jim Lippard.
+ */
+
+decode_base64:
+   proc options (main);
+
+   dcl hcs_$initiate_count entry
+      (char(*), char(*), char(*), fixed bin(24),
+       fixed bin(2), ptr, fixed bin(35));
+   dcl hcs_$make_seg entry
+      (char(*), char(*), char(*), fixed bin(5),
+       ptr, fixed bin(35));
+   dcl hcs_$set_bc_seg       entry (ptr, fixed bin(24),
+                                    fixed bin(35));
+   dcl hcs_$truncate_seg     entry (ptr, fixed bin(24),
+                                    fixed bin(35));
+   dcl hcs_$terminate_noname entry (ptr, fixed bin(35));
+   dcl cu_$arg_ptr   entry (fixed bin, ptr, fixed bin(21),
+                            fixed bin(35));
+   dcl expand_pathname_ entry (char(*), char(*), char(*),
+                               fixed bin(35));
+   dcl com_err_ entry options (variable);
+
+   dcl (byte, divide, index, mod, null, rank, rtrim, substr)
+       builtin;
+
+   dcl (in_dir, out_dir) char (168);
+   dcl (in_ent, out_ent) char (32);
+   dcl (in_ptr, tgt_ptr) ptr;
+   dcl (in_len, out_len) fixed bin (24);
+   dcl in_buf  char (in_len) based (in_ptr);
+   dcl tgt_seg char (OUT_MAX) based (tgt_ptr);
+
+   dcl argp    ptr;
+   dcl argl    fixed bin (21);
+   dcl arg_str char (argl) based (argp);
+   dcl code    fixed bin (35);
+   dcl (i, p, scount, v, o0, o1, o2) fixed bin (24);
+   dcl c       char (1);
+   dcl sv (0:3) fixed bin (24);
+   dcl sp (0:3) bit (1);
+   dcl ALPHA char (64);
+
+   dcl OUT_MAX  fixed bin (24) int static options (constant)
+                             init (1044480);
+   dcl RW_ACCESS fixed bin (5) int static options (constant)
+                             init (01010b);
+   dcl USAGE char (44) int static options (constant)
+      init ("Usage: decode_base64 input_file output_file");
+
+   /* ------------------------------------------------------- */
+   in_ptr  = null ();
+   tgt_ptr = null ();
+   ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl"
+        || "mnopqrstuvwxyz0123456789+/";
+
+   call cu_$arg_ptr (1, argp, argl, code);
+   if code ^= 0 then do;
+      call com_err_ (code, "decode_base64", "^a", USAGE);
+      return;
+   end;
+   call expand_pathname_ (arg_str, in_dir, in_ent, code);
+   if code ^= 0 then do;
+      call com_err_ (code, "decode_base64",
+         "Cannot resolve the input path.");
+      return;
+   end;
+
+   call cu_$arg_ptr (2, argp, argl, code);
+   if code ^= 0 then do;
+      call com_err_ (code, "decode_base64", "^a", USAGE);
+      return;
+   end;
+   call expand_pathname_ (arg_str, out_dir, out_ent, code);
+   if code ^= 0 then do;
+      call com_err_ (code, "decode_base64",
+         "Cannot resolve the output path.");
+      return;
+   end;
+
+   call hcs_$initiate_count (in_dir, in_ent, "", in_len, 0,
+                             in_ptr, code);
+   if in_ptr = null () then do;
+      call com_err_ (code, "decode_base64",
+         "Could not initiate input ^a>^a",
+         rtrim (in_dir), rtrim (in_ent));
+      return;
+   end;
+   in_len = divide (in_len, 9, 24, 0);
+
+   call hcs_$make_seg (out_dir, out_ent, "", RW_ACCESS,
+                       tgt_ptr, code);
+   if tgt_ptr = null () then do;
+      call com_err_ (code, "decode_base64",
+         "Could not create output ^a>^a",
+         rtrim (out_dir), rtrim (out_ent));
+      go to cleanup;
+   end;
+   call hcs_$truncate_seg (tgt_ptr, 0, code);
+   out_len = 0;
+   scount  = 0;
+
+   /* ---- gather base64 symbols four at a time ---- */
+   do i = 1 to in_len;
+      c = substr (in_buf, i, 1);
+      if c = "=" then do;
+         sv (scount) = 0;
+         sp (scount) = "1"b;
+         scount = scount + 1;
+      end;
+      else do;
+         p = index (ALPHA, c);
+         if p > 0 then do;
+            sv (scount) = p - 1;
+            sp (scount) = "0"b;
+            scount = scount + 1;
+         end;
+         /* any other character (space, tab, newline) is skipped */
+      end;
+      if scount = 4 then do;
+         call emit_quartet;
+         scount = 0;
+      end;
+   end;
+
+   if scount > 0 then
+      call com_err_ (0, "decode_base64",
+         "Warning: ^d leftover base64 characters ignored.",
+         scount);
+
+   call hcs_$set_bc_seg (tgt_ptr, out_len * 9, code);
+   call hcs_$truncate_seg (tgt_ptr,
+                           divide (out_len + 3, 4, 24, 0), code);
+   call hcs_$terminate_noname (tgt_ptr, code);
+
+cleanup:
+   if in_ptr ^= null () then
+      call hcs_$terminate_noname (in_ptr, code);
+   return;
+
+
+/* ---- Turn the four gathered symbols into up to three bytes.
+ *      A "=" pad in the third or fourth slot drops a byte.
+ */
+emit_quartet:
+   proc;
+
+   v  = sv (0) * 262144 + sv (1) * 4096 + sv (2) * 64 + sv (3);
+   o0 = divide (v, 65536, 24, 0);
+   o1 = mod (divide (v, 256, 24, 0), 256);
+   o2 = mod (v, 256);
+   call putb (o0);
+   if ^sp (2) then call putb (o1);
+   if ^sp (3) then call putb (o2);
+   end emit_quartet;
+
+
+/* ---- Append one decoded byte to the output segment. ---- */
+putb:
+   proc (oct);
+   dcl oct fixed bin (24);
+
+   if out_len >= OUT_MAX then do;
+      call com_err_ (0, "decode_base64",
+         "Decoded output exceeds one segment.");
+      go to cleanup;
+   end;
+   substr (tgt_seg, out_len + 1, 1) = byte (oct);
+   out_len = out_len + 1;
+   end putb;
+
+end decode_base64;

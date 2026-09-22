@@ -1,0 +1,801 @@
+/* unix_diff  old_file  new_file  {-output_file path | -of path}
+ *
+ * Companion to unix_patch.  Emits a unified diff of old_file
+ * against new_file such that
+ *     unix_patch  old_file  <this diff>  -of new_file
+ * reconstructs new_file.  With -output_file (-of) the diff is
+ * written to that segment; otherwise it is printed on standard
+ * output with ioa_.
+ *
+ * The old and new files may name archive components with the
+ * usual  dir>arch.archive::component  syntax, and the new-file
+ * argument (and -of) may use the equals convention (== or =).
+ *
+ * Method:  a real line-level diff.  Each line is fingerprinted,
+ * then Myers' O(ND) algorithm finds a shortest edit script --
+ * its work is proportional to the SIZE OF THE DIFFERENCE, not to
+ * the product of the file lengths, so two near-identical files
+ * diff quickly.  The differing regions become hunks with up to
+ * three lines of context, the shape diff -u and compare_ascii
+ * produce.  A trailing line with no newline is marked with the
+ * standard "\ No newline at end of file".  Identical files
+ * produce no output.  Files whose edit distance exceeds an
+ * internal limit fall back to a single whole-file hunk.
+ *
+ * Line width is kept under 72 columns so the file imports
+ * through the card reader without wrapping.
+ */
+
+/* Written 22 September 2026 by Claude Opus 4.8 at the direction
+ * of Jim Lippard.
+ */
+
+unix_diff:
+   proc options (main);
+
+   /* ---- hardcore gate entries ---- */
+   dcl hcs_$initiate_count entry
+      (char(*), char(*), char(*), fixed bin(24),
+       fixed bin(2), ptr, fixed bin(35));
+   dcl hcs_$make_seg entry
+      (char(*), char(*), char(*), fixed bin(5),
+       ptr, fixed bin(35));
+   dcl hcs_$set_bc_seg       entry (ptr, fixed bin(24),
+                                    fixed bin(35));
+   dcl hcs_$truncate_seg     entry (ptr, fixed bin(24),
+                                    fixed bin(35));
+   dcl hcs_$terminate_noname entry (ptr, fixed bin(35));
+
+   /* ---- command / utility entries ---- */
+   dcl cu_$arg_count entry (fixed bin, fixed bin(35));
+   dcl cu_$arg_ptr   entry (fixed bin, ptr, fixed bin(21),
+                            fixed bin(35));
+   dcl expand_pathname_$component entry
+      (char(*), char(*), char(*), char(*), fixed bin(35));
+   dcl archive_$get_component entry
+      (ptr, fixed bin(24), char(*), ptr, fixed bin(24),
+       fixed bin(35));
+   dcl get_equal_name_ entry (char(*), char(*), char(*),
+                              fixed bin(35));
+   dcl com_err_               entry options (variable);
+   dcl ioa_$nnl               entry options (variable);
+   dcl get_temp_segments_     entry (char(*), (*) ptr,
+                                     fixed bin(35));
+   dcl release_temp_segments_ entry (char(*), (*) ptr,
+                                     fixed bin(35));
+
+   /* ---- builtins ---- */
+   dcl (addrel, byte, divide, index, length, mod, null,
+        rank, rtrim, substr) builtin;
+
+   /* ---- resolved paths ---- */
+   dcl (old_dir, new_dir, of_dir)    char (168);
+   dcl (old_ent, new_ent, of_ent)    char (32);
+   dcl (old_comp, new_comp, of_comp) char (32);
+   dcl old_srcname                   char (32);
+   dcl eq_name                       char (32);
+
+   /* ---- argument scanning ---- */
+   dcl (nargs, i) fixed bin;
+   dcl code       fixed bin (35);
+   dcl argp       ptr;
+   dcl argl       fixed bin (21);
+   dcl arg_str    char (argl) based (argp);
+   dcl (old_argp, new_argp, of_argp) ptr;
+   dcl (old_argl, new_argl, of_argl) fixed bin (21);
+   dcl (old_seen, new_seen, have_of, temp_gotten) bit (1);
+
+   /* ---- segments ---- */
+   dcl (old_ptr, new_ptr, out_ptr, tgt_ptr) ptr;
+   dcl (old_data_ptr, new_data_ptr)         ptr;
+   dcl (old_len, new_len, out_len)          fixed bin (24);
+   dcl old_buf char (old_len) based (old_data_ptr);
+   dcl new_buf char (new_len) based (new_data_ptr);
+   dcl out_buf char (OUT_MAX) based (out_ptr);
+   dcl tgt_seg char (OUT_MAX) based (tgt_ptr);
+   dcl temp_segs (4) ptr;
+
+   /* ---- scratch arrays, packed into the temp segments ---- */
+   dcl (oi_ptr, ni_ptr, ofp_ptr, nfp_ptr, mate_ptr) ptr;
+   dcl (cba1_ptr, cba2_ptr, cbb1_ptr, cbb2_ptr)     ptr;
+   dcl tr_ptr                                       ptr;
+   dcl old_idx (0:LINE_HI) fixed bin (24) based (oi_ptr);
+   dcl new_idx (0:LINE_HI) fixed bin (24) based (ni_ptr);
+   dcl old_fp  (0:LINE_HI) fixed bin (24) based (ofp_ptr);
+   dcl new_fp  (0:LINE_HI) fixed bin (24) based (nfp_ptr);
+   dcl mate    (0:LINE_HI) fixed bin (24) based (mate_ptr);
+   dcl cb_a1   (0:LINE_HI) fixed bin (24) based (cba1_ptr);
+   dcl cb_a2   (0:LINE_HI) fixed bin (24) based (cba2_ptr);
+   dcl cb_b1   (0:LINE_HI) fixed bin (24) based (cbb1_ptr);
+   dcl cb_b2   (0:LINE_HI) fixed bin (24) based (cbb2_ptr);
+   dcl trace   (0:TR_HI)   fixed bin (24) based (tr_ptr);
+
+   /* ---- Myers furthest-reaching row (diagonal k at k+DMAX) ---- */
+   dcl vcur (0:V_HI) fixed bin (24);
+
+   /* ---- diff state ---- */
+   dcl (old_n, new_n, nchg) fixed bin (24);
+   dcl (d, dfound, k, x, y, td) fixed bin (24);
+   dcl (bx, by, xi, yi)         fixed bin (24);
+   dcl (prev_k, prev_x, prev_y) fixed bin (24);
+   dcl (mid_x, mid_y, vm, vp, base, ps, ss) fixed bin (24);
+   dcl (oi, ca, cb, pa, pb) fixed bin (24);
+   dcl (gi, ge, ai)         fixed bin (24);
+   dcl more                 bit (1);
+
+   /* ---- constants ---- */
+   dcl OUT_MAX  fixed bin (24) int static options (constant)
+                             init (1044480);
+   dcl LINE_MAX fixed bin (24) int static options (constant)
+                             init (20000);
+   dcl LINE_HI  fixed bin (24) int static options (constant)
+                             init (20001);
+   dcl ARR      fixed bin (24) int static options (constant)
+                             init (20002);
+   dcl DMAX     fixed bin (24) int static options (constant)
+                             init (700);
+   dcl V_HI     fixed bin (24) int static options (constant)
+                             init (1400);
+   dcl TR_HI    fixed bin (24) int static options (constant)
+                             init (246050);
+   dcl CONTEXT  fixed bin int static options (constant)
+                             init (3);
+   dcl FPMOD    fixed bin (35) int static options (constant)
+                             init (8388593);
+   dcl RW_ACCESS fixed bin (5) int static options (constant)
+                             init (01010b);
+   dcl DIGITS char (10) int static options (constant)
+                             init ("0123456789");
+   dcl NO_NL char (27) int static options (constant)
+                             init ("\ No newline at end of file");
+   dcl USAGE char (45) int static options (constant)
+      init ("Usage: unix_diff old_file new_file {-of path}");
+   dcl NL char (1);
+
+   /* ------------------------------------------------------- */
+
+   NL          = byte (10);
+   old_ptr     = null ();
+   new_ptr     = null ();
+   temp_gotten = "0"b;
+   old_seen    = "0"b;
+   new_seen    = "0"b;
+   have_of     = "0"b;
+
+   /* ---- parse the command line ---- */
+   call cu_$arg_count (nargs, code);
+   if code ^= 0 then do;
+      call com_err_ (code, "unix_diff", "^a", USAGE);
+      go to cleanup;
+   end;
+
+   i = 1;
+   do while (i <= nargs);
+      call cu_$arg_ptr (i, argp, argl, code);
+      if code ^= 0 then do;
+         call com_err_ (code, "unix_diff",
+            "Cannot access argument ^d.", i);
+         go to cleanup;
+      end;
+
+      if substr (arg_str, 1, 1) = "-" then do;
+         if arg_str = "-output_file" | arg_str = "-of"
+         then do;
+            if i >= nargs then do;
+               call com_err_ (0, "unix_diff",
+                  "No path after ^a.  ^a", arg_str, USAGE);
+               go to cleanup;
+            end;
+            i = i + 1;
+            call cu_$arg_ptr (i, of_argp, of_argl, code);
+            have_of = "1"b;
+         end;
+         else do;
+            call com_err_ (0, "unix_diff",
+               "Unknown control argument ^a.", arg_str);
+            go to cleanup;
+         end;
+      end;
+      else do;
+         if ^old_seen then do;
+            old_argp = argp;
+            old_argl = argl;
+            old_seen = "1"b;
+         end;
+         else if ^new_seen then do;
+            new_argp = argp;
+            new_argl = argl;
+            new_seen = "1"b;
+         end;
+         else do;
+            call com_err_ (0, "unix_diff",
+               "Too many arguments.  ^a", USAGE);
+            go to cleanup;
+         end;
+      end;
+
+      i = i + 1;
+   end;
+
+   if ^old_seen | ^new_seen then do;
+      call com_err_ (0, "unix_diff", "^a", USAGE);
+      go to cleanup;
+   end;
+
+   /* ---- resolve and open the old file ---- */
+   call resolve_comp (old_argp, old_argl, "old-file",
+                      old_dir, old_ent, old_comp);
+   call open_input ("old file", old_dir, old_ent, old_comp,
+                    old_data_ptr, old_len, old_ptr);
+
+   if old_comp ^= "" then old_srcname = old_comp;
+                     else old_srcname = old_ent;
+
+   /* ---- resolve and open the new file (equals allowed) ---- */
+   call resolve_comp (new_argp, new_argl, "new-file",
+                      new_dir, new_ent, new_comp);
+   if index (new_ent, "=") > 0 then do;
+      call get_equal_name_ (old_srcname, new_ent, eq_name,
+                            code);
+      if code ^= 0 then do;
+         call com_err_ (code, "unix_diff",
+            "Cannot apply the equal name ^a to ^a.",
+            rtrim (new_ent), rtrim (old_srcname));
+         go to cleanup;
+      end;
+      new_ent = eq_name;
+   end;
+   call open_input ("new file", new_dir, new_ent, new_comp,
+                    new_data_ptr, new_len, new_ptr);
+
+   /* ---- resolve the output path if -of was given ---- */
+   if have_of then do;
+      call resolve_comp (of_argp, of_argl, "output-file",
+                         of_dir, of_ent, of_comp);
+      if of_comp ^= "" then do;
+         call com_err_ (0, "unix_diff",
+            "Output to an archive component is not supported.");
+         go to cleanup;
+      end;
+      if index (of_ent, "=") > 0 then do;
+         call get_equal_name_ (old_srcname, of_ent, eq_name,
+                               code);
+         if code ^= 0 then do;
+            call com_err_ (code, "unix_diff",
+               "Cannot apply the equal name ^a to ^a.",
+               rtrim (of_ent), rtrim (old_srcname));
+            go to cleanup;
+         end;
+         of_ent = eq_name;
+      end;
+   end;
+
+   /* ---- scratch: output buffer + packed integer arrays ---- */
+   call get_temp_segments_ ("unix_diff", temp_segs, code);
+   if code ^= 0 then do;
+      call com_err_ (code, "unix_diff",
+         "Could not obtain temporary segments.");
+      go to cleanup;
+   end;
+   temp_gotten = "1"b;
+   out_ptr  = temp_segs (1);
+   oi_ptr   = temp_segs (2);
+   ni_ptr   = addrel (temp_segs (2), ARR);
+   cba1_ptr = addrel (temp_segs (2), 2 * ARR);
+   cba2_ptr = addrel (temp_segs (2), 3 * ARR);
+   cbb1_ptr = addrel (temp_segs (2), 4 * ARR);
+   cbb2_ptr = addrel (temp_segs (2), 5 * ARR);
+   ofp_ptr  = temp_segs (3);
+   nfp_ptr  = addrel (temp_segs (3), ARR);
+   mate_ptr = addrel (temp_segs (3), 2 * ARR);
+   tr_ptr   = temp_segs (4);
+   out_len = 0;
+
+   /* ---- index and fingerprint the lines of each file ---- */
+   call build_index (old_data_ptr, old_len, oi_ptr, old_n);
+   call build_index (new_data_ptr, new_len, ni_ptr, new_n);
+   call build_fp (old_data_ptr, old_n, oi_ptr, ofp_ptr);
+   call build_fp (new_data_ptr, new_n, ni_ptr, nfp_ptr);
+
+   /* ---- align the two files: fill mate(i) = matched new line
+    *      or -1, using Myers' shortest-edit-script search.      */
+   do ai = 0 to old_n - 1;
+      mate (ai) = -1;
+   end;
+
+   if old_n = 0 | new_n = 0 then ;    /* nothing can match */
+   else do;
+      dfound = -1;
+      vcur (1 + DMAX) = 0;
+      d = 0;
+      do while (d <= DMAX & dfound < 0);
+         td = divide (d * (d + 1), 2, 24, 0);
+         k = -d;
+         do while (k <= d & dfound < 0);
+            if k = -d then x = vcur (k + 1 + DMAX);
+            else if k = d then x = vcur (k - 1 + DMAX) + 1;
+            else if vcur (k-1+DMAX) < vcur (k+1+DMAX)
+                 then x = vcur (k + 1 + DMAX);
+                 else x = vcur (k - 1 + DMAX) + 1;
+            y = x - k;
+            more = "1"b;
+            do while (more);
+               if x >= old_n then more = "0"b;
+               else if y >= new_n then more = "0"b;
+               else if ^same (x, y) then more = "0"b;
+               else do;  x = x + 1;  y = y + 1;  end;
+            end;
+            vcur (k + DMAX) = x;
+            trace (td + divide (k + d, 2, 24, 0)) = x;
+            if x >= old_n & y >= new_n then dfound = d;
+            k = k + 2;
+         end;
+         d = d + 1;
+      end;
+
+      if dfound < 0 then do;
+         /* edit distance beyond the limit: keep the common head
+          * and tail, treat the rest as one replaced block. */
+         ps = 0;
+         more = "1"b;
+         do while (more);
+            if ps >= old_n then more = "0"b;
+            else if ps >= new_n then more = "0"b;
+            else if ^same (ps, ps) then more = "0"b;
+            else do;  mate (ps) = ps;  ps = ps + 1;  end;
+         end;
+         ss = 0;
+         more = "1"b;
+         do while (more);
+            if ss >= old_n - ps then more = "0"b;
+            else if ss >= new_n - ps then more = "0"b;
+            else if ^same (old_n-1-ss, new_n-1-ss)
+                 then more = "0"b;
+            else do;
+               mate (old_n-1-ss) = new_n-1-ss;
+               ss = ss + 1;
+            end;
+         end;
+      end;
+      else do;
+         /* backtrack the edit path to recover matched lines */
+         bx = old_n;
+         by = new_n;
+         do d = dfound to 1 by -1;
+            base = divide ((d - 1) * d, 2, 24, 0);
+            k = bx - by;
+            if k = -d then prev_k = k + 1;
+            else if k = d then prev_k = k - 1;
+            else do;
+               vm = trace (base + divide (k-1+d-1, 2, 24, 0));
+               vp = trace (base + divide (k+1+d-1, 2, 24, 0));
+               if vm < vp then prev_k = k + 1;
+                          else prev_k = k - 1;
+            end;
+            prev_x = trace (base
+                        + divide (prev_k+d-1, 2, 24, 0));
+            prev_y = prev_x - prev_k;
+            if prev_k = k + 1 then do;
+               mid_x = prev_x;
+               mid_y = prev_y + 1;
+            end;
+            else do;
+               mid_x = prev_x + 1;
+               mid_y = prev_y;
+            end;
+            xi = bx - 1;
+            yi = by - 1;
+            do while (xi >= mid_x & yi >= mid_y);
+               mate (xi) = yi;
+               xi = xi - 1;
+               yi = yi - 1;
+            end;
+            bx = prev_x;
+            by = prev_y;
+         end;
+         xi = bx - 1;
+         yi = by - 1;
+         do while (xi >= 0 & yi >= 0);
+            mate (xi) = yi;
+            xi = xi - 1;
+            yi = yi - 1;
+         end;
+      end;
+   end;
+
+   /* ---- collect the change blocks between matched anchors ---- */
+   nchg = 0;
+   pa = -1;
+   pb = -1;
+   do oi = 0 to old_n;
+      if oi < old_n then do;
+         if mate (oi) >= 0 then do;
+            ca = oi;  cb = mate (oi);
+            call add_change (pa + 1, ca, pb + 1, cb);
+            pa = ca;  pb = cb;
+         end;
+      end;
+      else call add_change (pa + 1, old_n, pb + 1, new_n);
+   end;
+
+   if nchg = 0 then go to deliver;    /* identical files */
+
+   /* ---- header lines (skipped by unix_patch, kept for Unix) ---- */
+   call emit ("--- ");
+   call emit (rtrim (old_ent));
+   call emit (NL);
+   call emit ("+++ ");
+   call emit (rtrim (new_ent));
+   call emit (NL);
+
+   /* ---- walk the change blocks, coalescing near neighbours ---- */
+   gi = 0;
+   do while (gi < nchg);
+      ge = gi;
+      more = "1"b;
+      do while (more);
+         if ge + 1 >= nchg then more = "0"b;
+         else if cb_a1 (ge + 1) - cb_a2 (ge) > 2 * CONTEXT
+              then more = "0"b;
+         else ge = ge + 1;
+      end;
+      call emit_hunk (gi, ge);
+      gi = ge + 1;
+   end;
+
+deliver:
+   if have_of then call flush_to_file;
+              else call flush_to_terminal;
+
+cleanup:
+   if temp_gotten then
+      call release_temp_segments_ ("unix_diff", temp_segs,
+                                   code);
+   if new_ptr ^= null () then
+      call hcs_$terminate_noname (new_ptr, code);
+   if old_ptr ^= null () then
+      call hcs_$terminate_noname (old_ptr, code);
+   return;
+
+
+/* ---- Split an argument into directory, entry and (archive)
+ *      component, accepting the archive "::" syntax that
+ *      expand_path_ rejects.  Star names are not yet handled.
+ */
+resolve_comp:
+   proc (ap, al, what, rdir, rent, rcomp);
+   dcl ap    ptr;
+   dcl al    fixed bin (21);
+   dcl what  char (*);
+   dcl rdir  char (*);
+   dcl rent  char (*);
+   dcl rcomp char (*);
+   dcl astr  char (al) based (ap);
+   dcl c     fixed bin (35);
+
+   call expand_pathname_$component (astr, rdir, rent, rcomp, c);
+   if c ^= 0 then do;
+      call com_err_ (c, "unix_diff",
+         "Cannot resolve the ^a path.", what);
+      go to cleanup;
+   end;
+   if index (rent, "*") > 0 | index (rcomp, "*") > 0 then do;
+      call com_err_ (0, "unix_diff",
+         "Star names are not yet supported (^a).",
+         rtrim (rent));
+      go to cleanup;
+   end;
+   end resolve_comp;
+
+
+/* ---- Initiate a resolved path and hand back a pointer and
+ *      character count for its data.  For an archive component
+ *      these describe the component inside the archive; SPTR is
+ *      always the initiated segment, for the caller to end.
+ */
+open_input:
+   proc (what, rdir, rent, rcomp, rptr, rlen, sptr);
+   dcl what  char (*);
+   dcl rdir  char (*);
+   dcl rent  char (*);
+   dcl rcomp char (*);
+   dcl rptr  ptr;
+   dcl rlen  fixed bin (24);
+   dcl sptr  ptr;
+   dcl (bc, cbc) fixed bin (24);
+   dcl cptr  ptr;
+   dcl c     fixed bin (35);
+
+   rptr = null ();
+   rlen = 0;
+   call hcs_$initiate_count (rdir, rent, "", bc, 0, sptr, c);
+   if sptr = null () then do;
+      call com_err_ (c, "unix_diff",
+         "Could not initiate ^a ^a>^a",
+         what, rtrim (rdir), rtrim (rent));
+      go to cleanup;
+   end;
+   if rcomp = "" then do;
+      rptr = sptr;
+      rlen = divide (bc, 9, 24, 0);
+      return;
+   end;
+   call archive_$get_component (sptr, bc, (rcomp), cptr, cbc,
+                                c);
+   if c ^= 0 then do;
+      call com_err_ (c, "unix_diff",
+         "Could not find component ^a in ^a>^a",
+         rtrim (rcomp), rtrim (rdir), rtrim (rent));
+      go to cleanup;
+   end;
+   rptr = cptr;
+   rlen = divide (cbc, 9, 24, 0);
+   end open_input;
+
+
+/* ---- Build the line-start index for a file (0-based lines).
+ *      idx(k) is the 1-based character offset of line k;
+ *      idx(cnt) is a sentinel one past the end.  A trailing
+ *      newline does NOT create an empty final line.
+ */
+build_index:
+   proc (bp, blen, ip, cnt);
+   dcl bp   ptr;
+   dcl blen fixed bin (24);
+   dcl ip   ptr;
+   dcl cnt  fixed bin (24);
+   dcl b    char (OUT_MAX) based (bp);
+   dcl idx  (0:LINE_HI) fixed bin (24) based (ip);
+   dcl (off, k2) fixed bin (24);
+
+   off = 1;
+   cnt = 0;
+   do while (off <= blen);
+      if cnt >= LINE_MAX then do;
+         call com_err_ (0, "unix_diff",
+            "Input has too many lines (limit ^d).", LINE_MAX);
+         go to cleanup;
+      end;
+      idx (cnt) = off;
+      k2 = index (substr (b, off), NL);
+      if k2 = 0 then off = blen + 1;
+                else off = off + k2;
+      cnt = cnt + 1;
+   end;
+   idx (cnt) = blen + 1;
+   end build_index;
+
+
+/* ---- Fingerprint each line for fast inequality tests. ---- */
+build_fp:
+   proc (bp, cnt, ip, fpp);
+   dcl bp   ptr;
+   dcl cnt  fixed bin (24);
+   dcl ip   ptr;
+   dcl fpp  ptr;
+   dcl b    char (OUT_MAX) based (bp);
+   dcl idx  (0:LINE_HI) fixed bin (24) based (ip);
+   dcl fp   (0:LINE_HI) fixed bin (24) based (fpp);
+   dcl (li, p, s, e) fixed bin (24);
+   dcl h    fixed bin (35);
+
+   do li = 0 to cnt - 1;
+      s = idx (li);
+      e = idx (li + 1);
+      h = 0;
+      do p = s to e - 1;
+         h = mod (h * 31 + rank (substr (b, p, 1)), FPMOD);
+      end;
+      fp (li) = h;
+   end;
+   end build_fp;
+
+
+/* ---- Do old line PI and new line PJ match (bytes and the
+ *      trailing-newline status both)?
+ */
+same:
+   proc (pi, pj) returns (bit (1));
+   dcl (pi, pj) fixed bin (24);
+   dcl (os, oe, ns, ne, ol, nl2) fixed bin (24);
+
+   if old_fp (pi) ^= new_fp (pj) then return ("0"b);
+   os = old_idx (pi);  oe = old_idx (pi + 1);  ol  = oe - os;
+   ns = new_idx (pj);  ne = new_idx (pj + 1);  nl2 = ne - ns;
+   if ol ^= nl2 then return ("0"b);
+   if ol = 0 then return ("1"b);
+   if substr (old_buf, os, ol) = substr (new_buf, ns, nl2)
+      then return ("1"b);
+   return ("0"b);
+   end same;
+
+
+/* ---- Record a change block if it is non-empty. ---- */
+add_change:
+   proc (a1, a2, b1, b2);
+   dcl (a1, a2, b1, b2) fixed bin (24);
+
+   if a2 > a1 | b2 > b1 then do;
+      if nchg > LINE_MAX then do;
+         call com_err_ (0, "unix_diff",
+            "Internal: too many change regions.");
+         go to cleanup;
+      end;
+      cb_a1 (nchg) = a1;  cb_a2 (nchg) = a2;
+      cb_b1 (nchg) = b1;  cb_b2 (nchg) = b2;
+      nchg = nchg + 1;
+   end;
+   end add_change;
+
+
+/* ---- Emit one hunk covering change blocks GS..GE, with up to
+ *      CONTEXT lines of surrounding context.
+ */
+emit_hunk:
+   proc (gs, ge);
+   dcl (gs, ge) fixed bin (24);
+   dcl (fa1, la2, fb1, lb2)       fixed bin (24);
+   dcl (a_start, a_end, b_start, b_end) fixed bin (24);
+   dcl (oc, nc, hoi, hnj)         fixed bin (24);
+
+   fa1 = cb_a1 (gs);  la2 = cb_a2 (ge);
+   fb1 = cb_b1 (gs);  lb2 = cb_b2 (ge);
+   a_start = fa1 - CONTEXT;
+   if a_start < 0 then a_start = 0;
+   a_end = la2 + CONTEXT;
+   if a_end > old_n then a_end = old_n;
+   b_start = fb1 - (fa1 - a_start);
+   b_end   = lb2 + (a_end - la2);
+   oc = a_end - a_start;
+   nc = b_end - b_start;
+
+   call emit ("@@ -");
+   call append_num (a_start + 1);
+   call emit (",");
+   call append_num (oc);
+   call emit (" +");
+   call append_num (b_start + 1);
+   call emit (",");
+   call append_num (nc);
+   call emit (" @@");
+   call emit (NL);
+
+   hoi = a_start;
+   hnj = b_start;
+   do while (hoi < a_end);
+      if mate (hoi) >= 0 then do;
+         do while (hnj < mate (hoi));
+            call emit_line (new_data_ptr, ni_ptr, hnj, "+");
+            hnj = hnj + 1;
+         end;
+         call emit_line (old_data_ptr, oi_ptr, hoi, " ");
+         hoi = hoi + 1;  hnj = hnj + 1;
+      end;
+      else do;
+         call emit_line (old_data_ptr, oi_ptr, hoi, "-");
+         hoi = hoi + 1;
+      end;
+   end;
+   do while (hnj < b_end);
+      call emit_line (new_data_ptr, ni_ptr, hnj, "+");
+      hnj = hnj + 1;
+   end;
+   end emit_hunk;
+
+
+/* ---- Emit one diff line: prefix, the line text without its
+ *      trailing newline, a newline, and (for a line with no
+ *      trailing newline) the no-newline marker.
+ */
+emit_line:
+   proc (bp, ip, li, pfx);
+   dcl bp  ptr;
+   dcl ip  ptr;
+   dcl li  fixed bin (24);
+   dcl pfx char (1);
+   dcl b   char (OUT_MAX) based (bp);
+   dcl idx (0:LINE_HI) fixed bin (24) based (ip);
+   dcl (s, e, full, tl) fixed bin (24);
+   dcl hn  bit (1);
+
+   s    = idx (li);
+   e    = idx (li + 1);
+   full = e - s;
+   if full <= 0 then return;
+   hn = (substr (b, e - 1, 1) = NL);
+   tl = full;
+   if hn then tl = tl - 1;
+
+   call emit (pfx);
+   if tl > 0 then call emit (substr (b, s, tl));
+   call emit (NL);
+   if ^hn then do;
+      call emit (NO_NL);
+      call emit (NL);
+   end;
+   end emit_line;
+
+
+/* ---- Append a non-negative integer in decimal. ---- */
+append_num:
+   proc (n);
+   dcl n   fixed bin (24);
+   dcl s   char (12) varying;
+   dcl (v, q) fixed bin (24);
+   dcl dig char (1);
+
+   if n <= 0 then do;
+      call emit ("0");
+      return;
+   end;
+   s = "";
+   v = n;
+   do while (v > 0);
+      q   = divide (v, 10, 24, 0);
+      dig = substr (DIGITS, v - q * 10 + 1, 1);
+      s   = dig || s;
+      v   = q;
+   end;
+   call emit ((s));
+   end append_num;
+
+
+/* ---- Append a string to the accumulation buffer. ---- */
+emit:
+   proc (str);
+   dcl str char (*);
+   dcl m   fixed bin (24);
+
+   m = length (str);
+   if m <= 0 then return;
+   if out_len + m > OUT_MAX then do;
+      call com_err_ (0, "unix_diff",
+         "Diff output exceeds one segment (^d chars).",
+         OUT_MAX);
+      go to cleanup;
+   end;
+   substr (out_buf, out_len + 1, m) = substr (str, 1, m);
+   out_len = out_len + m;
+   end emit;
+
+
+/* ---- Write the accumulated diff to the -output_file segment. */
+flush_to_file:
+   proc;
+   dcl c2 fixed bin (35);
+
+   call hcs_$make_seg (of_dir, of_ent, "", RW_ACCESS,
+                       tgt_ptr, c2);
+   if tgt_ptr = null () then do;
+      call com_err_ (c2, "unix_diff",
+         "Could not create output file ^a>^a",
+         rtrim (of_dir), rtrim (of_ent));
+      go to cleanup;
+   end;
+   call hcs_$truncate_seg (tgt_ptr, 0, c2);
+   if out_len > 0 then
+      substr (tgt_seg, 1, out_len)
+         = substr (out_buf, 1, out_len);
+   call hcs_$set_bc_seg (tgt_ptr, out_len * 9, c2);
+   call hcs_$truncate_seg (tgt_ptr,
+                           divide (out_len + 3, 4, 24, 0), c2);
+   call hcs_$terminate_noname (tgt_ptr, c2);
+   end flush_to_file;
+
+
+/* ---- Print the accumulated diff on standard output. ---- */
+flush_to_terminal:
+   proc;
+   dcl (o, k3, seglen) fixed bin (24);
+
+   o = 1;
+   do while (o <= out_len);
+      k3 = index (substr (out_buf, o, out_len - o + 1), NL);
+      if k3 = 0 then seglen = out_len - o + 1;
+                else seglen = k3;
+      call ioa_$nnl ("^a", substr (out_buf, o, seglen));
+      o = o + seglen;
+   end;
+   end flush_to_terminal;
+
+end unix_diff;

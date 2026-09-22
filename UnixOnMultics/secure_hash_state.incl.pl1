@@ -1,0 +1,50 @@
+/* BEGIN INCLUDE FILE ... secure_hash_state.incl.pl1 */
+
+/* State for the incremental entries of secure_hash_.  The structure is of
+   fixed size, so a caller may declare it automatic, internal static, or
+   allocate it in an area:
+
+	dcl 1 my_state aligned like sha256_state;
+	call secure_hash_$sha256_init (addr (my_state), SHA_PACK_BYTE8, code);
+
+   Every entry but $sha256_init checks the version and returns
+   error_table_$unimplemented_version if it does not match.
+
+   Version 2 changed what buffer holds.  Under SHA_PACK_BYTE8 it now holds
+   the caller's characters exactly as they were found, nine bits each, and
+   the eight-bit octets are extracted a whole word at a time when the block
+   is compressed; version 1 masked each character as it was stored.  The
+   digests are identical either way, but a version 1 state carries data the
+   present code would read differently, which is what the version field is
+   for.								*/
+
+dcl 1 sha256_state aligned based (sha256_state_ptr),
+      2 version char (8),			/* SHA256_STATE_VERSION_2 */
+      2 mode fixed bin,				/* SHA_PACK_ value, below */
+      2 flags,
+        3 high_bits_seen bit (1) unaligned,	/* ON: a 9th bit was nonzero */
+        3 tail_seen bit (1) unaligned,		/* ON: short DENSE9 group taken */
+        3 mbz bit (34) unaligned,
+      2 octet_count fixed bin (71),		/* octets absorbed so far */
+      2 buf_len fixed bin,			/* octets held in buffer, 0..63 */
+      2 h (0:7) fixed bin (35),			/* chaining value, 32 bits each */
+      2 buffer char (64) aligned;		/* partial block, one octet per
+						   character.  Word aligned: it
+						   is overlaid by a bit (576)
+						   to extract octets.	*/
+
+dcl  sha256_state_ptr ptr;
+
+dcl  SHA256_STATE_VERSION_2 char (8) int static options (constant)
+	init ("sha2_002");
+
+/* Octet derivation.  SHA-256 is defined on octets; a Multics segment is
+   36-bit words of four 9-bit bytes, so the caller must say which octet
+   stream is to be hashed.  See the documentation for the interchange
+   consequences of each.							*/
+
+dcl (SHA_PACK_BYTE8 init (1),			/* low 8 bits of each 9-bit byte */
+     SHA_PACK_DENSE9 init (2)			/* 2 words -> 9 octets, lossless */
+     ) fixed bin int static options (constant);
+
+/* END INCLUDE FILE ... secure_hash_state.incl.pl1 */

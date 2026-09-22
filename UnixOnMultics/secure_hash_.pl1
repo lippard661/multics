@@ -1,0 +1,686 @@
+/* *******************************************************
+   *				    	       *
+   * secure_hash_ -- SHA-256 message digest (FIPS 180-4) *
+   *					       *
+   ******************************************************* */
+
+/* Written:	21 September 2026 by Claude Opus 5.0 at the direction
+                    of Jim Lippard.
+   Modified:	21 September 2026, to remove the division and the per-octet
+		procedure calls from the block function; see below.	*/
+
+/* The hash is computed over an octet stream derived from the caller's
+   storage.  Because a Multics character is nine bits and SHA-256 is defined
+   on octets, the derivation is part of the interface, not an implementation
+   detail; see secure_hash_state.incl.pl1 for the SHA_PACK_ values.
+
+   $sha256 and the other short entries use SHA_PACK_BYTE8, which takes the
+   low eight bits of each nine-bit byte.  For ASCII text and for any file
+   that arrived here as octets, that reproduces the digest the file has on
+   the system it came from, which is what makes this useful for checking that
+   a transfer into or out of Multics did not corrupt anything.  Line
+   terminators are hashed as stored: Multics uses NL alone, as Unix and
+   current macOS do, so a text segment matches its Unix counterpart, but a
+   file moved in ASCII mode to or from a CR LF system is a different octet
+   stream and will have a different digest.  Any such translation is the
+   caller's business, not this subroutine's.
+
+   If a ninth bit is found set under SHA_PACK_BYTE8, the digest is still
+   returned but the code is error_table_$bad_conversion: information present
+   in the storage did not reach the hash.  Callers who know the segment is
+   native text may ignore it.  SHA_PACK_DENSE9 packs two words into nine
+   octets and loses nothing, and is the right choice for object segments and
+   other native binary; no other system will independently compute the same
+   value.
+
+   Arithmetic.  SHA-256 is defined on 32-bit words, which leaves four spare
+   bits in a Multics word.  Every intermediate sum here has at most five
+   terms below 2**32, hence is below 2**35 and cannot overflow fixed bin
+   (35), so the reduction modulo 2**32 is done once per sum by masking rather
+   than after every addition.
+
+   Speed.  The first version of this program expressed the rotations as
+   divide and mod by a power of two held in an array, and reached the
+   compiler as real division -- the most expensive instruction on the
+   machine -- twice per rotation, 1248 times per 64-octet block.  It also
+   called an internal procedure for every rotation, exclusive or, and octet,
+   some 2000 calls per block.  Neither had anything to do with the word size.
+   The rotations are now done by taking a 32-bit window out of a 64-bit
+   string holding the value twice, so a rotation is one EIS bit-string move
+   and there is no arithmetic in it at all; the block function contains no
+   procedure calls; and a run of characters is now copied into the buffer
+   with one string move rather than one call per octet.  The inner loops are
+   correspondingly harder to read than the arithmetic they replace, which is
+   why the operation each one performs is named in a comment.		*/
+
+/* format: style2 */
+
+secure_hash_: proc;
+
+	return;					/* not an entry point */
+
+/* Parameters */
+
+dcl  a_ptr ptr parameter;
+dcl  a_bitcnt fixed bin (24) parameter;
+dcl  a_mode fixed bin parameter;
+dcl  a_digest bit (256) aligned parameter;
+dcl  a_string char (*) parameter;
+dcl  a_code fixed bin (35) parameter;
+dcl  a_sp ptr parameter;
+dcl  a_dirname char (*) parameter;
+dcl  a_ename char (*) parameter;
+dcl  a_bits bit (*) aligned parameter;
+
+/* Automatic */
+
+dcl  sp ptr;					/* -> sha256_state */
+dcl  bufp ptr;					/* -> its buffer */
+dcl  segp ptr;
+dcl  fcbp ptr;
+dcl  code fixed bin (35);
+dcl  hcode fixed bin (35);
+dcl  bitcnt fixed bin (24);
+dcl  component fixed bin;
+dcl  digest bit (256) aligned;
+dcl  1 auto_state aligned like sha256_state;
+
+/* The buffer, seen as bits.  Sixty-four nine-bit characters, sixteen words.
+   Character n occupies bits 9n-8 through 9n; its low eight bits, which are
+   the octet, are bits 9n-7 through 9n.				*/
+
+dcl  buf_bits bit (576) aligned based (bufp);
+
+/* Constants */
+
+dcl  HEX_DIGITS char (16) int static options (constant)
+	init ("0123456789abcdef");
+
+dcl  MASK32 bit (36) aligned int static options (constant)
+	init ("000011111111111111111111111111111111"b);
+
+/* The high bit of each of the four nine-bit bytes in a word: the bits that
+   SHA_PACK_BYTE8 discards.					*/
+
+dcl  NINTH_BITS bit (36) aligned int static options (constant)
+	init ("100000000100000000100000000100000000"b);
+
+dcl  XOR bit (4) aligned int static options (constant) init ("0110"b);
+
+/* First 32 bits of the fractional parts of the square roots of the first
+   eight primes.							*/
+
+dcl  H0 (0:7) fixed bin (35) int static options (constant)
+	init (1779033703, 3144134277, 1013904242, 2773480762,
+	1359893119, 2600822924, 528734635, 1541459225);
+
+/* First 32 bits of the fractional parts of the cube roots of the first
+   sixty-four primes.							*/
+
+dcl  K (0:63) fixed bin (35) int static options (constant)
+	init (1116352408, 1899447441, 3049323471, 3921009573,
+	961987163, 1508970993, 2453635748, 2870763221,
+	3624381080, 310598401, 607225278, 1426881987,
+	1925078388, 2162078206, 2614888103, 3248222580,
+	3835390401, 4022224774, 264347078, 604807628,
+	770255983, 1249150122, 1555081692, 1996064986,
+	2554220882, 2821834349, 2952996808, 3210313671,
+	3336571891, 3584528711, 113926993, 338241895,
+	666307205, 773529912, 1294757372, 1396182291,
+	1695183700, 1986661051, 2177026350, 2456956037,
+	2730485921, 2820302411, 3259730800, 3345764771,
+	3516065817, 3600352804, 4094571909, 275423344,
+	430227734, 506948616, 659060556, 883997877,
+	958139571, 1322822218, 1537002063, 1747873779,
+	1955562222, 2024104815, 2227730452, 2361852424,
+	2428436474, 2756734187, 3204031479, 3329325298);
+
+/* External */
+
+dcl  error_table_$bad_arg fixed bin (35) ext static;
+dcl  error_table_$bad_conversion fixed bin (35) ext static;
+dcl  error_table_$dirseg fixed bin (35) ext static;
+dcl  error_table_$smallarg fixed bin (35) ext static;
+dcl  error_table_$unimplemented_version fixed bin (35) ext static;
+
+dcl  initiate_file_ entry (char (*), char (*), bit (*), ptr, fixed bin (24),
+	fixed bin (35));
+dcl  terminate_file_ entry (ptr, fixed bin (24), bit (*), fixed bin (35));
+dcl  msf_manager_$open entry (char (*), char (*), ptr, fixed bin (35));
+dcl  msf_manager_$get_ptr entry (ptr, fixed bin, bit (1), ptr,
+	fixed bin (24), fixed bin (35));
+dcl  msf_manager_$close entry (ptr);
+
+dcl  R_ACCESS bit (3) int static options (constant) init ("100"b);
+dcl  TERM_FILE_TERM bit (3) int static options (constant) init ("001"b);
+
+/* Builtins */
+
+dcl (addr, binary, bool, divide, length, min, mod, null, substr, unspec)
+	builtin;
+
+/* * * * * * * * * * * *	one-shot entries	* * * * * * * * * * * */
+
+sha256:	entry (a_ptr, a_bitcnt, a_digest, a_code);
+
+	call setup (SHA_PACK_BYTE8);
+	call absorb (a_ptr, a_bitcnt);
+	call wrap_up (a_digest, a_code);
+	return;
+
+sha256_octets:
+	entry (a_ptr, a_bitcnt, a_mode, a_digest, a_code);
+
+	if a_mode ^= SHA_PACK_BYTE8 & a_mode ^= SHA_PACK_DENSE9
+	then do;
+	     a_code = error_table_$bad_arg;
+	     return;
+	end;
+	call setup (a_mode);
+	call absorb (a_ptr, a_bitcnt);
+	call wrap_up (a_digest, a_code);
+	return;
+
+sha256_hex:
+	entry (a_ptr, a_bitcnt, a_string, a_code);
+
+	call setup (SHA_PACK_BYTE8);
+	call absorb (a_ptr, a_bitcnt);
+	call wrap_up (digest, a_code);
+	call hexify (digest, a_string, hcode);
+	if a_code = 0 then a_code = hcode;
+	return;
+
+/* * * * * * * * * * * *	incremental entries	* * * * * * * * * * * */
+
+sha256_init:
+	entry (a_sp, a_mode, a_code);
+
+	if a_mode ^= SHA_PACK_BYTE8 & a_mode ^= SHA_PACK_DENSE9
+	then do;
+	     a_code = error_table_$bad_arg;
+	     return;
+	end;
+	sp = a_sp;
+	bufp = addr (sp -> sha256_state.buffer);
+	sp -> sha256_state.version = SHA256_STATE_VERSION_2;
+	sp -> sha256_state.mode = a_mode;
+	call clear;
+	a_code = 0;
+	return;
+
+sha256_reset:
+	entry (a_sp, a_code);
+
+	call check_version (a_sp, a_code);
+	if a_code ^= 0 then return;
+	call clear;
+	return;
+
+sha256_add:
+	entry (a_sp, a_ptr, a_bitcnt, a_code);
+
+	call check_version (a_sp, a_code);
+	if a_code ^= 0 then return;
+
+/* Under DENSE9 the octet stream is defined on 72-bit groups, so every call
+   but the last must present a whole number of them.			*/
+
+	if sp -> sha256_state.mode = SHA_PACK_DENSE9
+	then do;
+	     if sp -> sha256_state.flags.tail_seen
+	     then do;
+		a_code = error_table_$bad_arg;
+		return;
+	     end;
+	     if mod (a_bitcnt, 72) ^= 0
+	     then sp -> sha256_state.flags.tail_seen = "1"b;
+	end;
+
+	call absorb (a_ptr, a_bitcnt);
+	a_code = 0;
+	return;
+
+sha256_final:
+	entry (a_sp, a_digest, a_code);
+
+	call check_version (a_sp, a_code);
+	if a_code ^= 0 then return;
+	call wrap_up (a_digest, a_code);
+	call clear;					/* reusable, per Digest::SHA */
+	return;
+
+sha256_final_hex:
+	entry (a_sp, a_string, a_code);
+
+	call check_version (a_sp, a_code);
+	if a_code ^= 0 then return;
+	call wrap_up (digest, a_code);
+	call clear;
+	call hexify (digest, a_string, hcode);
+	if a_code = 0 then a_code = hcode;
+	return;
+
+/* * * * * * * * * * * *	whole-file entry	* * * * * * * * * * * */
+
+sha256_file:
+	entry (a_dirname, a_ename, a_mode, a_digest, a_code);
+
+	if a_mode ^= SHA_PACK_BYTE8 & a_mode ^= SHA_PACK_DENSE9
+	then do;
+	     a_code = error_table_$bad_arg;
+	     return;
+	end;
+	call setup (a_mode);
+
+	call initiate_file_ (a_dirname, a_ename, R_ACCESS, segp, bitcnt, code);
+
+	if code = 0
+	then do;					/* ordinary segment */
+	     call absorb (segp, bitcnt);
+	     call terminate_file_ (segp, 0, TERM_FILE_TERM, (0));
+	end;
+
+	else if code = error_table_$dirseg
+	then do;					/* multisegment file */
+	     call msf_manager_$open (a_dirname, a_ename, fcbp, code);
+	     if code ^= 0
+	     then do;
+		a_code = code;
+		return;
+	     end;
+	     do component = 0 by 1;
+		call msf_manager_$get_ptr (fcbp, component, "0"b, segp,
+		     bitcnt, code);
+		if code ^= 0 | segp = null () then go to msf_done;
+		call absorb (segp, bitcnt);
+	     end;
+msf_done:
+	     call msf_manager_$close (fcbp);
+	end;
+
+	else do;
+	     a_code = code;
+	     return;
+	end;
+
+	call wrap_up (a_digest, a_code);
+	return;
+
+/* * * * * * * * * * * *	conversion entry	* * * * * * * * * * * */
+
+/* There is no standard library entry that renders binary as hexadecimal.
+   Multics is an octal system: cv_hex_ and its relatives parse hexadecimal
+   into binary, and cv_bin_ goes the other way but takes a fixed bin (17),
+   left justifies its result, and does not say what case it produces -- none
+   of which suits a digest, where the field is wider than any arithmetic
+   type, leading zeros are significant, and the case must be lower to match
+   the rest of the world.  Hence this entry, which is written to stand on
+   its own should it ever belong somewhere more general than a hash package:
+   it takes a bit string of any length rather than a number.
+
+	call secure_hash_$bit_to_hex (bits, string, code);
+
+   Each four bits become one lowercase digit, most significant first.  If the
+   length of bits is not a multiple of four, the final group is taken as
+   though padded on the right with zeros, so a bit (10) yields three digits.
+   If string is longer than the digits produced, the remainder is blanked; if
+   it is shorter, the digits that fit are returned and the code is
+   error_table_$smallarg, so that silent truncation of a digest cannot
+   happen.								*/
+
+bit_to_hex:
+	entry (a_bits, a_string, a_code);
+
+	call hexify (a_bits, a_string, a_code);
+	return;
+
+/* * * * * * * * * * * *	internal procedures	* * * * * * * * * * * */
+
+setup:	proc (mode);
+
+dcl  mode fixed bin parameter;
+
+	sp = addr (auto_state);
+	bufp = addr (sp -> sha256_state.buffer);
+	sp -> sha256_state.version = SHA256_STATE_VERSION_2;
+	sp -> sha256_state.mode = mode;
+	call clear;
+
+     end setup;
+
+clear:	proc;
+
+dcl  i fixed bin;
+
+	unspec (sp -> sha256_state.flags) = "0"b;
+	sp -> sha256_state.octet_count = 0;
+	sp -> sha256_state.buf_len = 0;
+	do i = 0 to 7;
+	     sp -> sha256_state.h (i) = H0 (i);
+	end;
+	sp -> sha256_state.buffer = "";
+
+     end clear;
+
+check_version:
+	proc (statep, cd);
+
+dcl  statep ptr parameter;
+dcl  cd fixed bin (35) parameter;
+
+	sp = statep;
+	if sp = null ()
+	then do;
+	     cd = error_table_$bad_arg;
+	     return;
+	end;
+	bufp = addr (sp -> sha256_state.buffer);
+	if sp -> sha256_state.version ^= SHA256_STATE_VERSION_2
+	then cd = error_table_$unimplemented_version;
+	else cd = 0;
+
+     end check_version;
+
+/* absorb -- derive octets from the caller's storage and feed them in.
+
+   Under BYTE8 the caller's characters are copied into the buffer untouched,
+   as many at a time as will fit, and the ninth bits are dealt with in
+   compress, a whole word at a time.  Under DENSE9 the input has to be
+   repacked, so the octets go in one at a time, but that path runs over
+   native binary rather than over transferred files and is the rarer of the
+   two.								*/
+
+absorb:	proc (p, nbits);
+
+dcl  p ptr parameter;
+dcl  nbits fixed bin (24) parameter;
+
+dcl  nchars fixed bin (24);
+dcl  ngroups fixed bin (24);
+dcl  navail fixed bin;
+dcl (i, k, n) fixed bin (24);
+dcl  j fixed bin;
+dcl  group bit (72) aligned;
+dcl  based_chars char (nchars) based (p);
+dcl  based_bits bit (nbits) based (p);
+
+	if nbits <= 0 then return;
+
+	if sp -> sha256_state.mode = SHA_PACK_BYTE8
+	then do;
+	     nchars = divide (nbits, 9, 24, 0);	/* whole characters only */
+	     k = 1;
+	     do while (k <= nchars);
+		n = min (64 - sp -> sha256_state.buf_len, nchars - k + 1);
+		substr (sp -> sha256_state.buffer,
+		     sp -> sha256_state.buf_len + 1, n) =
+		     substr (based_chars, k, n);
+		sp -> sha256_state.buf_len =
+		     sp -> sha256_state.buf_len + n;
+		sp -> sha256_state.octet_count =
+		     sp -> sha256_state.octet_count + n;
+		k = k + n;
+		if sp -> sha256_state.buf_len = 64
+		then do;
+		     call compress;
+		     sp -> sha256_state.buf_len = 0;
+		end;
+	     end;
+	end;
+
+	else do;					/* SHA_PACK_DENSE9 */
+	     ngroups = divide (nbits + 71, 72, 24, 0);
+	     do i = 1 to ngroups;
+		group = "0"b;			/* zero fill a short group */
+		navail = min (72, nbits - (i - 1) * 72);
+		substr (group, 1, navail) =
+		     substr (based_bits, (i - 1) * 72 + 1, navail);
+		do j = 1 to 9;
+		     call put_octet (substr (group, 8 * j - 7, 8));
+		end;
+		sp -> sha256_state.octet_count =
+		     sp -> sha256_state.octet_count + 9;
+	     end;
+	end;
+
+     end absorb;
+
+/* put_octet -- append one octet, given as eight bits.  Used by the DENSE9
+   path and by the padding; the BYTE8 path moves whole strings instead.  */
+
+put_octet:
+	proc (octet);
+
+dcl  octet bit (8) aligned parameter;
+
+	sp -> sha256_state.buf_len = sp -> sha256_state.buf_len + 1;
+	substr (buf_bits, 9 * sp -> sha256_state.buf_len - 8, 9) =
+	     "0"b || octet;
+	if sp -> sha256_state.buf_len = 64
+	then do;
+	     call compress;
+	     sp -> sha256_state.buf_len = 0;
+	end;
+
+     end put_octet;
+
+/* wrap_up -- pad, compress the last block, and deliver the digest. */
+
+wrap_up:	proc (dig, cd);
+
+dcl  dig bit (256) aligned parameter;
+dcl  cd fixed bin (35) parameter;
+
+dcl  msg_bits fixed bin (71);
+dcl  len_bits bit (64) aligned;
+dcl  i fixed bin;
+
+	msg_bits = sp -> sha256_state.octet_count * 8;
+
+/* A fixed bin (71) is 72 bits, one of sign and 71 of magnitude, so its low
+   64 bits are already the length field SHA-256 wants, most significant end
+   first.  No conversion is needed.				*/
+
+	len_bits = substr (unspec (msg_bits), 9, 64);
+
+	call put_octet ("10000000"b);			/* the mandatory "1" bit */
+	do while (sp -> sha256_state.buf_len ^= 56);
+	     call put_octet ("00000000"b);
+	end;
+	do i = 1 to 8;
+	     call put_octet (substr (len_bits, 8 * i - 7, 8));
+	end;
+
+	do i = 0 to 7;
+	     substr (dig, 32 * i + 1, 32) =
+		substr (unspec (sp -> sha256_state.h (i)), 5, 32);
+	end;
+
+	if sp -> sha256_state.flags.high_bits_seen
+	then cd = error_table_$bad_conversion;
+	else cd = 0;
+
+     end wrap_up;
+
+/* compress -- the SHA-256 block function.
+
+   No procedure is called from here and no division is performed.  A rotation
+   right by n is the 32-bit window beginning n places from the end of a
+   64-bit string holding the value twice, which the compiler renders as a
+   single EIS instruction that extracts the unaligned field and combines it
+   with the accumulated value in one go; the comment on each line names the
+   operation FIPS 180-4 calls for.
+
+   Two rearrangements of this loop have been tried and measured, and both
+   were slower.  Building the rotations from arl and als within a word so as
+   to avoid EIS altogether cost 57 per cent; unrolling eight rounds to
+   eliminate the a..h shuffle, together with writing the three-way exclusive
+   ors as accumulation, cost a further 14 per cent.  Under emulation the
+   price is paid per instruction executed, almost regardless of what the
+   instruction does, so one csl that moves 32 bits is worth about five single
+   word instructions and is not the thing to economize.  Measure before
+   changing this loop, and measure with sha256_time rather than by hand:
+   consecutive runs of one build vary by a third.
+
+   CH and MAJ are the one place where the operators win, because they let the
+   exclusive ors go away rather than being replaced: the two terms of CH
+   cannot both be one, and MAJ is the majority function, so an or computes
+   each of them exactly.					*/
+
+compress:	proc;
+
+dcl  w (0:63) fixed bin (35);
+dcl (aa, bb, cc, dd, ee, ff, gg, hh) fixed bin (35);
+dcl (t1, t2, x, y) fixed bin (35);
+dcl (v, u, p, q, r) bit (32) aligned;
+dcl  dbl bit (64) aligned;
+dcl (i, b) fixed bin;
+
+/* The first sixteen words: the low eight bits of each of the four nine-bit
+   bytes of a word, concatenated.  The discarded ninth bits are tested a
+   word at a time on the way past.				*/
+
+	do i = 0 to 15;
+	     b = 36 * i;
+	     substr (v, 1, 8) = substr (buf_bits, b + 2, 8);
+	     substr (v, 9, 8) = substr (buf_bits, b + 11, 8);
+	     substr (v, 17, 8) = substr (buf_bits, b + 20, 8);
+	     substr (v, 25, 8) = substr (buf_bits, b + 29, 8);
+	     unspec (w (i)) = "0000"b || v;
+	     if (substr (buf_bits, b + 1, 36) & NINTH_BITS) ^= "0"b
+	     then sp -> sha256_state.flags.high_bits_seen = "1"b;
+	end;
+
+/* The message schedule. */
+
+	do i = 16 to 63;
+	     v = substr (unspec (w (i - 15)), 5, 32);
+	     dbl = v || v;
+	     p = bool (bool (substr (dbl, 26, 32),	/* SSIG0: rotr 7 */
+		substr (dbl, 15, 32), XOR),		/* rotr 18 */
+		"000"b || substr (v, 1, 29), XOR);	/* shr 3 */
+
+	     u = substr (unspec (w (i - 2)), 5, 32);
+	     dbl = u || u;
+	     q = bool (bool (substr (dbl, 16, 32),	/* SSIG1: rotr 17 */
+		substr (dbl, 14, 32), XOR),		/* rotr 19 */
+		"0000000000"b || substr (u, 1, 22), XOR);	/* shr 10 */
+
+	     unspec (x) = "0000"b || p;
+	     unspec (y) = "0000"b || q;
+	     x = y + w (i - 7) + x + w (i - 16);	/* four terms, < 2**34 */
+	     unspec (w (i)) = unspec (x) & MASK32;
+	end;
+
+	aa = sp -> sha256_state.h (0);
+	bb = sp -> sha256_state.h (1);
+	cc = sp -> sha256_state.h (2);
+	dd = sp -> sha256_state.h (3);
+	ee = sp -> sha256_state.h (4);
+	ff = sp -> sha256_state.h (5);
+	gg = sp -> sha256_state.h (6);
+	hh = sp -> sha256_state.h (7);
+
+	do i = 0 to 63;
+	     v = substr (unspec (ee), 5, 32);
+	     dbl = v || v;
+	     p = bool (bool (substr (dbl, 27, 32),	/* BSIG1: rotr 6 */
+		substr (dbl, 22, 32), XOR),		/* rotr 11 */
+		substr (dbl, 8, 32), XOR);		/* rotr 25 */
+
+/* CH (e, f, g) = (e and f) xor (not e and g).  The two terms cannot both be
+   one, so an or computes it exactly and no csl is needed.	*/
+
+	     q = (v & substr (unspec (ff), 5, 32))
+		| ((^v) & substr (unspec (gg), 5, 32));
+
+	     unspec (x) = "0000"b || p;
+	     unspec (y) = "0000"b || q;
+	     t1 = hh + x + y + K (i) + w (i);		/* five terms, < 2**35 */
+	     unspec (t1) = unspec (t1) & MASK32;
+
+	     u = substr (unspec (aa), 5, 32);
+	     dbl = u || u;
+	     p = bool (bool (substr (dbl, 31, 32),	/* BSIG0: rotr 2 */
+		substr (dbl, 20, 32), XOR),		/* rotr 13 */
+		substr (dbl, 11, 32), XOR);		/* rotr 22 */
+
+/* MAJ (a, b, c) is the majority function, which is the or of the three
+   pairwise ands.						*/
+
+	     q = substr (unspec (bb), 5, 32);
+	     r = substr (unspec (cc), 5, 32);
+	     q = (u & q) | (u & r) | (q & r);
+
+	     unspec (x) = "0000"b || p;
+	     unspec (y) = "0000"b || q;
+	     t2 = x + y;
+	     unspec (t2) = unspec (t2) & MASK32;
+
+	     hh = gg;
+	     gg = ff;
+	     ff = ee;
+	     ee = dd + t1;
+	     unspec (ee) = unspec (ee) & MASK32;
+	     dd = cc;
+	     cc = bb;
+	     bb = aa;
+	     aa = t1 + t2;
+	     unspec (aa) = unspec (aa) & MASK32;
+	end;
+
+	x = sp -> sha256_state.h (0) + aa;
+	unspec (sp -> sha256_state.h (0)) = unspec (x) & MASK32;
+	x = sp -> sha256_state.h (1) + bb;
+	unspec (sp -> sha256_state.h (1)) = unspec (x) & MASK32;
+	x = sp -> sha256_state.h (2) + cc;
+	unspec (sp -> sha256_state.h (2)) = unspec (x) & MASK32;
+	x = sp -> sha256_state.h (3) + dd;
+	unspec (sp -> sha256_state.h (3)) = unspec (x) & MASK32;
+	x = sp -> sha256_state.h (4) + ee;
+	unspec (sp -> sha256_state.h (4)) = unspec (x) & MASK32;
+	x = sp -> sha256_state.h (5) + ff;
+	unspec (sp -> sha256_state.h (5)) = unspec (x) & MASK32;
+	x = sp -> sha256_state.h (6) + gg;
+	unspec (sp -> sha256_state.h (6)) = unspec (x) & MASK32;
+	x = sp -> sha256_state.h (7) + hh;
+	unspec (sp -> sha256_state.h (7)) = unspec (x) & MASK32;
+
+     end compress;
+
+/* hexify -- see the commentary on the bit_to_hex entry. */
+
+hexify:	proc (b, s, cd);
+
+dcl  b bit (*) aligned parameter;
+dcl  s char (*) parameter;
+dcl  cd fixed bin (35) parameter;
+
+dcl  lb fixed bin (24);
+dcl (ndigits, nfit, navail, i) fixed bin;
+dcl  nibble bit (4) aligned;
+
+	lb = length (b);
+	ndigits = divide (lb + 3, 4, 17, 0);		/* round up */
+	nfit = min (ndigits, length (s));
+
+	do i = 1 to nfit;
+	     nibble = "0000"b;			/* pads a short final group */
+	     navail = min (4, lb - 4 * i + 4);
+	     substr (nibble, 1, navail) = substr (b, 4 * i - 3, navail);
+	     substr (s, i, 1) =
+		substr (HEX_DIGITS, binary (nibble, 17) + 1, 1);
+	end;
+
+	if length (s) > nfit then substr (s, nfit + 1) = "";
+
+	if nfit < ndigits
+	then cd = error_table_$smallarg;
+	else cd = 0;
+
+     end hexify;
+
+%include secure_hash_state;
+
+     end secure_hash_;

@@ -1,0 +1,187 @@
+/* encode_base64  input_file  output_file
+ *
+ * Writes a base64 transcription of input_file to output_file.
+ * base64 uses only the characters  A-Z a-z 0-9 + /  with = for
+ * padding, and NO spaces or tabs -- so the result survives copy
+ * and paste between Multics systems intact: none of its bytes
+ * are the erase, kill, or escape characters, and there is no
+ * whitespace for terminal canonicalization to rewrite.  Move the
+ * output to another system by any means, then decode_base64 it
+ * to recover the original file byte for byte.
+ *
+ * The transcription is wrapped at 64 characters per line; the
+ * decoder ignores those line breaks (and any other whitespace).
+ *
+ * Note: each 9-bit character is transferred as its low 8 bits,
+ * which is exact for ordinary text (7-bit ASCII).  Line width is
+ * kept under 72 columns for the card reader.
+ *
+ * Written 22 September 2026 by Claude Opus 4.8 at the direction
+ * of Jim Lippard.
+ */
+
+encode_base64:
+   proc options (main);
+
+   dcl hcs_$initiate_count entry
+      (char(*), char(*), char(*), fixed bin(24),
+       fixed bin(2), ptr, fixed bin(35));
+   dcl hcs_$make_seg entry
+      (char(*), char(*), char(*), fixed bin(5),
+       ptr, fixed bin(35));
+   dcl hcs_$set_bc_seg       entry (ptr, fixed bin(24),
+                                    fixed bin(35));
+   dcl hcs_$truncate_seg     entry (ptr, fixed bin(24),
+                                    fixed bin(35));
+   dcl hcs_$terminate_noname entry (ptr, fixed bin(35));
+   dcl cu_$arg_ptr   entry (fixed bin, ptr, fixed bin(21),
+                            fixed bin(35));
+   dcl expand_pathname_ entry (char(*), char(*), char(*),
+                               fixed bin(35));
+   dcl com_err_ entry options (variable);
+
+   dcl (byte, divide, length, mod, null, rank, rtrim, substr)
+       builtin;
+
+   dcl (in_dir, out_dir) char (168);
+   dcl (in_ent, out_ent) char (32);
+   dcl (in_ptr, tgt_ptr) ptr;
+   dcl (in_len, out_len) fixed bin (24);
+   dcl in_buf  char (in_len) based (in_ptr);
+   dcl tgt_seg char (OUT_MAX) based (tgt_ptr);
+
+   dcl argp    ptr;
+   dcl argl    fixed bin (21);
+   dcl arg_str char (argl) based (argp);
+   dcl code    fixed bin (35);
+   dcl (i, col, nb, v, g0, g1, g2, g3) fixed bin (24);
+   dcl (b0, b1, b2)                    fixed bin (24);
+   dcl ALPHA char (64);
+
+   dcl OUT_MAX  fixed bin (24) int static options (constant)
+                             init (1044480);
+   dcl RW_ACCESS fixed bin (5) int static options (constant)
+                             init (01010b);
+   dcl LINEW fixed bin int static options (constant) init (64);
+   dcl USAGE char (44) int static options (constant)
+      init ("Usage: encode_base64 input_file output_file");
+   dcl NL char (1);
+
+   /* ------------------------------------------------------- */
+   NL = byte (10);
+   in_ptr  = null ();
+   tgt_ptr = null ();
+   ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl"
+        || "mnopqrstuvwxyz0123456789+/";
+
+   call cu_$arg_ptr (1, argp, argl, code);
+   if code ^= 0 then do;
+      call com_err_ (code, "encode_base64", "^a", USAGE);
+      return;
+   end;
+   call expand_pathname_ (arg_str, in_dir, in_ent, code);
+   if code ^= 0 then do;
+      call com_err_ (code, "encode_base64",
+         "Cannot resolve the input path.");
+      return;
+   end;
+
+   call cu_$arg_ptr (2, argp, argl, code);
+   if code ^= 0 then do;
+      call com_err_ (code, "encode_base64", "^a", USAGE);
+      return;
+   end;
+   call expand_pathname_ (arg_str, out_dir, out_ent, code);
+   if code ^= 0 then do;
+      call com_err_ (code, "encode_base64",
+         "Cannot resolve the output path.");
+      return;
+   end;
+
+   call hcs_$initiate_count (in_dir, in_ent, "", in_len, 0,
+                             in_ptr, code);
+   if in_ptr = null () then do;
+      call com_err_ (code, "encode_base64",
+         "Could not initiate input ^a>^a",
+         rtrim (in_dir), rtrim (in_ent));
+      return;
+   end;
+   in_len = divide (in_len, 9, 24, 0);
+
+   call hcs_$make_seg (out_dir, out_ent, "", RW_ACCESS,
+                       tgt_ptr, code);
+   if tgt_ptr = null () then do;
+      call com_err_ (code, "encode_base64",
+         "Could not create output ^a>^a",
+         rtrim (out_dir), rtrim (out_ent));
+      go to cleanup;
+   end;
+   call hcs_$truncate_seg (tgt_ptr, 0, code);
+   out_len = 0;
+   col     = 0;
+
+   /* ---- encode three octets at a time ---- */
+   i = 1;
+   do while (i <= in_len);
+      nb = in_len - i + 1;
+      if nb > 3 then nb = 3;
+      b0 = mod (rank (substr (in_buf, i, 1)), 256);
+      if nb >= 2 then b1 = mod (rank (substr (in_buf, i+1, 1)), 256);
+                 else b1 = 0;
+      if nb >= 3 then b2 = mod (rank (substr (in_buf, i+2, 1)), 256);
+                 else b2 = 0;
+      v  = b0 * 65536 + b1 * 256 + b2;
+      g0 = divide (v, 262144, 24, 0);
+      g1 = mod (divide (v, 4096, 24, 0), 64);
+      g2 = mod (divide (v, 64, 24, 0), 64);
+      g3 = mod (v, 64);
+      call put (substr (ALPHA, g0 + 1, 1));
+      call put (substr (ALPHA, g1 + 1, 1));
+      if nb >= 2 then call put (substr (ALPHA, g2 + 1, 1));
+                 else call put ("=");
+      if nb >= 3 then call put (substr (ALPHA, g3 + 1, 1));
+                 else call put ("=");
+      i = i + 3;
+   end;
+   if col > 0 then call put (NL);
+
+   call hcs_$set_bc_seg (tgt_ptr, out_len * 9, code);
+   call hcs_$truncate_seg (tgt_ptr,
+                           divide (out_len + 3, 4, 24, 0), code);
+   call hcs_$terminate_noname (tgt_ptr, code);
+
+cleanup:
+   if in_ptr ^= null () then
+      call hcs_$terminate_noname (in_ptr, code);
+   return;
+
+
+/* ---- Append one character, wrapping the line at LINEW. ---- */
+put:
+   proc (ch);
+   dcl ch char (1);
+
+   if out_len >= OUT_MAX then do;
+      call com_err_ (0, "encode_base64",
+         "Encoded output exceeds one segment.");
+      go to cleanup;
+   end;
+   substr (tgt_seg, out_len + 1, 1) = ch;
+   out_len = out_len + 1;
+   if ch = NL then col = 0;
+   else do;
+      col = col + 1;
+      if col >= LINEW then do;
+         if out_len >= OUT_MAX then do;
+            call com_err_ (0, "encode_base64",
+               "Encoded output exceeds one segment.");
+            go to cleanup;
+         end;
+         substr (tgt_seg, out_len + 1, 1) = NL;
+         out_len = out_len + 1;
+         col = 0;
+      end;
+   end;
+   end put;
+
+end encode_base64;

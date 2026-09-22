@@ -1,0 +1,336 @@
+/* **********************************************************
+   *						*
+   * sha256 -- command and active function for secure_hash_ *
+   *						*
+   ********************************************************** */
+
+/* Written:	21 September 2026 by Claude Opus 5.0 at the
+                    direction of Jim Lippard.
+
+   Usage as a command:
+
+	sha256 paths {-control_args}
+
+   Usage as an active function:
+
+	[sha256 path {-control_args}]
+
+   Control arguments:
+
+	-string STR, -str STR	hash the character string STR rather than a
+				  file.  May be given more than once in
+				  command form, and may be mixed with paths.
+	-byte8, -b8		derive octets by taking the low eight bits of
+				  each nine-bit byte.  (Default.)  This is the
+				  interchange form: a text segment, or a file
+				  that arrived here as octets, hashes to the
+				  value it has elsewhere.
+	-dense9, -d9		pack two words into nine octets, losing
+				  nothing.  For object segments and other
+				  native binary.  No other system computes
+				  this value.
+	-brief, -bf		print the hash alone, without the pathname.
+
+   The hash is printed as 64 lowercase hexadecimal digits, matching the
+   convention of sha256sum and cksum -a sha256 elsewhere.  In command form
+   the pathname as typed follows, after two spaces, unless -brief is given;
+   a -string value is never echoed.  The active function returns the 64
+   digits alone and accepts exactly one value to hash.
+
+   A file whose ninth bits are not all zero still yields a digest, but a
+   warning is printed on error_output: under -byte8 those bits did not reach
+   the hash, so the value will not match a foreign copy of the file.
+
+   Control arguments apply to every value regardless of where they appear,
+   so the argument list is read twice: once for the control arguments, once
+   for the values.							*/
+
+/* format: style2 */
+
+sha256:	proc;
+
+/* Automatic */
+
+dcl  af_sw bit (1) aligned;
+dcl  brief_sw bit (1) aligned;
+dcl  skip_next bit (1) aligned;
+dcl  mode fixed bin;
+dcl (nargs, argno, nitems) fixed bin;
+dcl  ap ptr;
+dcl  al fixed bin (21);
+dcl  sp ptr;
+dcl  sl fixed bin (21);
+dcl  retp ptr;
+dcl  ret_lth fixed bin (21);
+dcl  code fixed bin (35);
+dcl  hcode fixed bin (35);
+dcl  hash char (64);
+dcl  digest bit (256) aligned;
+dcl  dirname char (168);
+dcl  ename char (32);
+
+dcl  arg char (al) based (ap);
+dcl  str char (sl) based (sp);
+dcl  return_string char (ret_lth) varying based (retp);
+
+/* Constants */
+
+dcl  ME char (6) int static options (constant) init ("sha256");
+
+/* External */
+
+dcl  com_err_ entry () options (variable);
+dcl  active_fnc_err_ entry () options (variable);
+dcl  ioa_ entry () options (variable);
+
+dcl  cu_$af_return_arg entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+dcl  expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+
+dcl  secure_hash_$sha256_hex entry (ptr, fixed bin (24), char (*),
+	fixed bin (35));
+dcl  secure_hash_$sha256_file entry (char (*), char (*), fixed bin,
+	bit (256) aligned, fixed bin (35));
+dcl  secure_hash_$bit_to_hex entry (bit (*) aligned, char (*),
+	fixed bin (35));
+
+dcl  error_table_$badopt fixed bin (35) ext static;
+dcl  error_table_$bad_conversion fixed bin (35) ext static;
+dcl  error_table_$noarg fixed bin (35) ext static;
+dcl  error_table_$not_act_fnc fixed bin (35) ext static;
+dcl  error_table_$too_many_args fixed bin (35) ext static;
+
+/* Builtins */
+
+dcl (addr, length, substr) builtin;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/* The command processor resolves a command name to an entry point of that
+   name, so an added name on the segment needs a matching entry here before
+   it will work:  add_name sha256 sha.  Flowing into an ENTRY statement does
+   nothing, so both names run the same code.			*/
+
+sha:	entry;
+
+	call cu_$af_return_arg (nargs, retp, ret_lth, code);
+
+	if code = 0
+	then af_sw = "1"b;
+	else if code = error_table_$not_act_fnc
+	then do;
+	     af_sw = "0"b;
+	     code = 0;
+	end;
+	else do;
+	     call com_err_ (code, ME);
+	     return;
+	end;
+
+	if nargs = 0
+	then do;
+	     call usage;
+	     return;
+	end;
+
+/* First pass: the control arguments. */
+
+	mode = SHA_PACK_BYTE8;
+	brief_sw = "0"b;
+	skip_next = "0"b;
+
+	do argno = 1 to nargs;
+	     if skip_next
+	     then do;
+		skip_next = "0"b;
+		go to next_control;
+	     end;
+
+	     call cu_$arg_ptr (argno, ap, al, code);
+	     if code ^= 0
+	     then do;
+		call error (code, "Reading an argument.", "");
+		return;
+	     end;
+
+	     if al = 0 then go to next_control;
+	     if substr (arg, 1, 1) ^= "-" then go to next_control;
+
+	     if arg = "-string" | arg = "-str"
+	     then do;
+		if argno = nargs
+		then do;
+		     call error (error_table_$noarg, "After ^a.", arg);
+		     return;
+		end;
+		skip_next = "1"b;			/* its value is not a path */
+	     end;
+	     else if arg = "-byte8" | arg = "-b8"
+	     then mode = SHA_PACK_BYTE8;
+	     else if arg = "-dense9" | arg = "-d9"
+	     then mode = SHA_PACK_DENSE9;
+	     else if arg = "-brief" | arg = "-bf"
+	     then brief_sw = "1"b;
+	     else do;
+		call error (error_table_$badopt, "^a", arg);
+		return;
+	     end;
+
+next_control:
+	end;
+
+/* Second pass: the values. */
+
+	nitems = 0;
+	skip_next = "0"b;
+
+	do argno = 1 to nargs;
+	     if skip_next
+	     then do;
+		skip_next = "0"b;
+		go to next_value;
+	     end;
+
+	     call cu_$arg_ptr (argno, ap, al, code);
+
+	     if al > 0
+	     then if substr (arg, 1, 1) = "-"
+		then do;
+		     if arg = "-string" | arg = "-str"
+		     then do;
+			skip_next = "1"b;
+			call cu_$arg_ptr (argno + 1, sp, sl, code);
+			if code ^= 0
+			then do;
+			     call error (code, "Reading the value after ^a.",
+				arg);
+			     return;
+			end;
+			if ^count_item () then return;
+			call hash_string;
+		     end;
+		     go to next_value;		/* any other control arg */
+		end;
+
+	     if ^count_item () then return;
+	     call hash_path;
+
+next_value:
+	end;
+
+	if nitems = 0
+	then call usage;
+
+	return;
+
+/* * * * * * * * * * * *	internal procedures	* * * * * * * * * * * */
+
+/* count_item -- an active function returns one value, so it takes one. */
+
+count_item:
+	proc returns (bit (1) aligned);
+
+	nitems = nitems + 1;
+	if af_sw & nitems > 1
+	then do;
+	     call active_fnc_err_ (error_table_$too_many_args, ME,
+		"Only one value may be hashed by the active function.");
+	     return ("0"b);
+	end;
+	return ("1"b);
+
+     end count_item;
+
+hash_string:
+	proc;
+
+dcl  nbits fixed bin (24);
+
+	nbits = 9 * sl;
+	call secure_hash_$sha256_hex (addr (str), nbits, hash, code);
+
+	if ^check_code ("the string") then return;
+	call report ("");				/* never echo the string */
+
+     end hash_string;
+
+hash_path:
+	proc;
+
+	call expand_pathname_ (arg, dirname, ename, code);
+	if code ^= 0
+	then do;
+	     call error (code, "^a", arg);
+	     return;
+	end;
+
+	call secure_hash_$sha256_file (dirname, ename, mode, digest, code);
+	if ^check_code (arg) then return;
+
+	call secure_hash_$bit_to_hex (digest, hash, hcode);
+	if hcode ^= 0				/* cannot happen: 256 bits, 64 chars */
+	then do;
+	     call error (hcode, "^a", arg);
+	     return;
+	end;
+	call report (arg);
+
+     end hash_path;
+
+/* check_code -- error_table_$bad_conversion is a warning, not a failure:
+   the digest is good for the octets that were hashed, but a ninth bit was
+   set and did not reach them.						*/
+
+check_code:
+	proc (name) returns (bit (1) aligned);
+
+dcl  name char (*) parameter;
+
+	if code = 0 then return ("1"b);
+
+	if code = error_table_$bad_conversion
+	then do;
+	     call com_err_ (0, ME,
+		"Warning: a ninth bit was set in ^a; the hash covers only^/the low eight bits of each byte.  Use -dense9 for native binary.",
+		name);
+	     return ("1"b);
+	end;
+
+	call error (code, "^a", name);
+	return ("0"b);
+
+     end check_code;
+
+report:	proc (name);
+
+dcl  name char (*) parameter;
+
+	if af_sw
+	then return_string = hash;
+	else if brief_sw | length (name) = 0
+	then call ioa_ ("^a", hash);
+	else call ioa_ ("^a  ^a", hash, name);
+
+     end report;
+
+error:	proc (cd, ctl, a1);
+
+dcl  cd fixed bin (35) parameter;
+dcl  ctl char (*) parameter;
+dcl  a1 char (*) parameter;
+
+	if af_sw
+	then call active_fnc_err_ (cd, ME, ctl, a1);
+	else call com_err_ (cd, ME, ctl, a1);
+
+     end error;
+
+usage:	proc;
+
+	call error (0, "Usage:  ^a paths {-control_args}", ME);
+
+     end usage;
+
+%include secure_hash_state;
+
+     end sha256;
