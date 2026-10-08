@@ -1,0 +1,46 @@
+Object Segment >user_dir_dir>Multics>Lippard>l>e>bound_video_ext_
+Created on 09/11/83  1912.7 pdt Sun
+by Lippard.Multics.a
+using Multics Binder, Version 10.2 of Thurdsay, January 15, 1981
+
+Translator:         binder
+Comment:            
+Source:
+   00/00/00  0000.0 gmt Tue    >udd>Multics>Lippard>l>o>bound_video_ext_.archive
+Attributes:         bound, procedure, standard, perprocess_static
+
+        Object    Text    Defs    Link    Symb  Static
+Start        0       0    1120    1266    1304    1276
+Length    3016    1120     146      16    1476       0
+
+
+11 Definitions:
+
+
+segname:    bound_video_ext_
+
+symb|0          bind_map
+symb|0          symbol_table
+
+segname:    deunderline_word
+
+text|11         deunderline_word                Entrypoint
+
+segname:    get_word_index_
+
+text|255        get_word_index_                 Entrypoint
+
+segname:    uclc_word
+
+text|437        uclc_word                       Entrypoint
+
+segname:    underline_word
+
+text|627        underline_word                  Entrypoint
+
+
+3 Links:
+
+link|12     *symbol|0
+link|14     canonicalize_
+link|10     error_table_$action_not_performed

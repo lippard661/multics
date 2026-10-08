@@ -1,0 +1,67 @@
+/* Reconstructed source code by Claude Opus 5.5 4 Oct 2026 */
+/* Original source written by Jim Lippard and last compiled
+   on 29 July 1983. */
+
+/* uclc_word: a line-editor request for the Multics video system (bind it
+   to a key with set_editor_key_bindings).  In the word at or before the
+   cursor, it changes the first character that is not already a capital
+   letter to upper case, and leaves the cursor after the word.  So it
+   capitalizes a lower-case word; on a word that already starts with a
+   capital it capitalizes the next lower-case letter.  A word that starts
+   with a digit or other non-letter is left as it is, since that
+   character is the first non-capital and translate leaves it alone.
+
+   Compiled as Lippard.Multics.a with a symbol table (-table), so the
+   variable names here (window_line_editor_ptr, code, start_pos, end_pos,
+   idx, jdx, upper, lower) are the original ones.  The other three
+   components follow them.
+
+   Notes on the original:
+     - code is set only on failure; the caller is expected to clear it.
+     - With a repetition count above 1 it works on the same word again,
+       capitalizing one more letter each time, since the cursor stays on
+       the word until the end. */
+
+uclc_word:
+     procedure (window_line_editor_ptr, code);
+
+	dcl     window_line_editor_ptr ptr parameter;
+	dcl     code		 fixed bin (35) parameter;
+
+	dcl     upper		 char (26) init ("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+	dcl     lower		 char (26) init ("abcdefghijklmnopqrstuvwxyz");
+	dcl     (start_pos, end_pos)	 fixed bin;
+	dcl     (idx, jdx)		 fixed bin;
+
+	dcl     get_word_index_	 entry (char (*), fixed bin (21), fixed bin (21), fixed bin, fixed bin);
+
+	dcl     error_table_$action_not_performed fixed bin (35) external static;
+
+	dcl     (addr, index, substr, translate) builtin;
+
+	line_editor_info_ptr = window_line_editor_ptr;
+
+	do idx = 1 to line_editor_info.repetition_count;
+	     call get_word_index_ (line_editor_input_line, line_editor_info.line_length,
+		line_editor_info.cursor_index, start_pos, end_pos);
+	     if start_pos = 0 | end_pos = 0 then do;
+		     code = error_table_$action_not_performed;
+		     return;
+		end;
+
+	     do jdx = start_pos to end_pos;
+		if index (upper, substr (line_editor_input_line, jdx, 1)) = 0 then do;
+			substr (line_editor_input_line, jdx, 1) =
+			     translate (substr (line_editor_input_line, jdx, 1), upper, lower);
+			jdx = end_pos;
+		     end;
+	     end;
+	end;
+
+	line_editor_info.cursor_index = end_pos + 1;
+	window_line_editor_ptr = line_editor_info_ptr;
+	return;
+
+%include window_line_editor;
+
+     end uclc_word;

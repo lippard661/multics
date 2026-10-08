@@ -1,0 +1,22 @@
+// print_bindmap: Bindmap for >user_dir_dir>Multics>Lippard>l>e>bound_video_ext_
+Created on 09/11/83  1912.7 pdt Sun, by Lippard.Multics.a
+using Multics Binder, Version 10.2 of Thurdsay, January 15, 1981
+>udd>Multics>Lippard>l>o>bound_video_ext_.archive
+
+        Object    Text    Defs    Link    Symb  Static
+Start        0       0    1120    1266    1304    1276
+Length    3016    1120     146      16    1476       0
+
+
+Component                            Text        Int-Stat       Symbol         Date      Source
+                                 Start Length  Start Length  Start Length   Compiled    Language
+
+deunderline_word                     0    242      0      0    100    130 04/28/83 1502.7 PL/I
+get_word_index_                    242    146      0      0    230    112 03/16/83 2252.5 PL/I
+uclc_word                          410    206      0      0    342    654 07/29/83 1542.9 PL/I
+underline_word                     616    302      0      0   1216    130 04/28/83 1504.0 PL/I
+
+
+Bindfile                            Date Updated        Date Modified
+
+bound_video_ext_.bind             09/11/83  1912.5 mst Sun    09/11/83  1912.5 mst Sun
