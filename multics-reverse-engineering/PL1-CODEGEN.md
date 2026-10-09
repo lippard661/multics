@@ -2,7 +2,10 @@
 
 These are the patterns met while reconstructing about 45 programs compiled
 by PL/I releases 27c, 28d, 28e and the 1983 "Experimental" compilers. The
-current compiler (33f) generates very similar code. Operator names are from
+current compiler (33f) generates very similar code. Code from much older
+releases (such as 22a, 1977) has been reconstructed successfully too, but
+expect occasional differences in semantics as well as codegen (see
+WORKFLOW.md §5). Operator names are from
 `pl1_operator_names_.alm` (see `tools/opnames.py`), and mxdis prints them
 automatically.
 

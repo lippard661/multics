@@ -86,6 +86,7 @@ header as "Change needed for current Multics: …":
 | WARNING 47: an aligned structure member passed to char(*), or a mismatched variable argument | Drop `aligned` or use a matching-type index variable |
 | WARNING 235: implicit string→arithmetic conversion | Use `binary (x, p)` |
 | ERROR: `go to` into a do-group | Move the label outside the group |
+| `size ()` of a based structure with `refer` extents. Release 22a (1977, seen in memory.pl1) took the extent from the stored refer field; 33f evaluates the extent *expression* (the variable before `refer`). If that variable is a dummy that is never set, the sizes are garbage. The clue is 33f's WARNING 307, "referenced but never set" | Make the extent expression itself read the stored field, e.g. declare an overlay of the same block and write `char (entry.max_size refer (max_entry.max_size))` |
 | A variable named `then` | Rename it |
 | Nested comments | Not allowed in PL/I; rewrite |
 
@@ -98,6 +99,28 @@ The person compiles each file and reports ERRORs and WARNINGs verbatim,
 then runs it. Optionally they compile with `-list` so you can compare its
 generated code with the original's disassembly. If results differ between
 two systems, compare the installed versions of each dependency.
+
+## 6a. Reconstructing a lost include file
+
+An include file leaves no object of its own, but every program compiled
+with it records its layout in the code. For memory_seg.incl.pl1, a lost
+include file used by memory.pl1, Eric Swenson's Claude session
+rebuilt the file from memory.pl1 (its source and its 1977 object code),
+and the program then recompiled and worked.
+
+* Collect every program that includes the file. The plk Source list names
+  the include files.
+* Find the structure accesses in each: the pointer register, the word
+  offset and the type from the instructions (`lda`/`ldq` for fixed bin,
+  `ldaq` for fixed bin(71) or pointer, `mlr` lengths for strings, `cana`
+  masks for bit flags).
+* Look for `refer` extents: a length or count read from a field of the
+  same structure before an array or string is addressed.
+* Use a `-table` symbol tree if any user of the file has one. It gives the
+  field names.
+* Verify by recompiling the users against the reconstructed include file
+  (with `-list`) and checking that the offsets match the original code.
+  Then check the porting table above: old refer semantics in particular.
 
 ## 7. Bindfiles for bound segments
 
@@ -180,4 +203,9 @@ Review each result yourself before giving it to the person.
 * Uninitialised variables, ignored error codes and reads past the end of a
   string are common in the originals. Report them, but keep them until a
   fix is requested.
+* The older the original compiler, the more you should expect differences
+  in *meaning*, not just in generated code. A reconstruction that matches
+  the disassembly can still behave differently under 33f (see the `refer`
+  row above). Read every WARNING from the recompile, including the
+  harmless-looking ones.
 * Keep the original binaries. They are the evidence.
