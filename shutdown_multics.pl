@@ -38,6 +38,7 @@ my $logout_daemons = 1;
 # A normal run takes well under a minute.
 my %T = (
     attention       => 5,     # wait for M-> after each ESC
+    release_check   => 1.5,   # an M-> followed this soon by RELEASED was a release
     attention_tries => 4,     # ESC retries if daemon output delays the prompt
     settle          => 2,     # pause after a prompt before typing (the console
                               # shows the prompt before its read is ready, and
@@ -188,19 +189,36 @@ sub fail {
 }
 
 # ESC toggles the console: it grabs attention (M->) when idle, but releases a
-# read that is already pending (CONSOLE: RELEASED). If we hit a live read,
-# just press ESC again to get a fresh one.
+# read that is already pending, printing "M-> CONSOLE: RELEASED". So an M->
+# only counts if no RELEASED follows it; if we hit a live read, press ESC
+# again to get a fresh one.
 sub attention {
     for my $try (1 .. $T{attention_tries}) {
         drain();
         send_key('Escape');
         my $r = wait_for($T{attention}, $RE_MPROMPT, $RE_RELEASE);
-        return 1 if $r == 0;
+        if ($r == 0) {
+            return 1 if wait_for($T{release_check}, $RE_RELEASE) < 0;
+            $r = 1;
+        }
         if ($r == 1) {
             print "   released a pending read; pressing ESC again...\n";
             next;
         }
         print "   no M-> prompt yet (try $try), retrying...\n";
+    }
+    return 0;
+}
+
+# Release a pending read on purpose. While a read is pending the console
+# holds back other output (e.g. the LOGOUT lines after 'logout * * *').
+# If the read already timed out, our first ESC grabs instead of releasing,
+# so the next one releases.
+sub release_console {
+    for (1 .. 3) {
+        drain();
+        send_key('Escape');
+        return 1 if wait_for($T{attention}, $RE_RELEASE) >= 0;
     }
     return 0;
 }
@@ -276,6 +294,11 @@ if ($state eq 'multics') {
         send_cmd('logout * * *',
                  qr/logout \* \* \*|\bReady\b|$RE_LOGOUT/, undef, 1)
             or fail("'logout * * *' was not accepted by the console");
+        # After "Ready" the console posts a new M-> read, and holds the LOGOUT
+        # lines back until that read is released, so release it.
+        wait_for($T{echo}, $RE_MPROMPT);
+        release_console()
+            or print "   could not release the console; LOGOUTs may be held back\n";
         my $n = wait_for_logouts($mark);
         print "   $n daemon(s) logged out.\n";
     }
