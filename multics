@@ -9,7 +9,7 @@ daemon_flags="new-session -d -s multics '/usr/local/bin/dps8 /home/_multics/MR12
 # Default timeout for start/stop. A clean Multics shutdown (logging out
 # daemons, dropping to BCE, halting) takes far longer than rc.subr's 30 s
 # default. multics_timeout in /etc/rc.conf.local still overrides this.
-daemon_timeout="300"
+daemon_timeout="450"
 
 . /etc/rc.d/rc.subr
 

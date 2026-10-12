@@ -46,15 +46,11 @@ set rdr0 watch
 set rdr0 card_type=mcc
 ```
 
-I do not yet fully trust the shutdown_multics.pl script to always work
-successfully; I often have to connect to the console from root with
-the "multicscons" alias and do a new "shutdown" and then the BCE
-"die". So I do NOT do a "rcctl enable multics", I only start it up
-manually and shut it down manually.  Once I'm convinced it's reliable,
-and if I decide I do want it running 24/7, only then will I use "rcctl
-enable" and have it come up when the system I run it on comes up.
+This version of shutdown_multics.pl is now fairly reliable, but if it
+fails you can connect to the console with the "multicscons" alias
+defined below and do a new "shutdown" and then the BCE "die."
 
-I'm also not making my system available to the Internet (or even to my
+I'm still not making my system available to the Internet (or even to my
 local network), though I am considering doing so in the future. That
 requires use of dps8m-proxy, which can be found here:
 
