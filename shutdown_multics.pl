@@ -17,6 +17,8 @@ use strict;
 use warnings;
 use Time::HiRes qw(sleep time);
 
+$| = 1;    # unbuffered output, so progress shows live under rcctl -d
+
 # --- CONFIGURATION ---
 my $tmux_bin    = '/usr/bin/tmux';
 my $pgrep_bin   = '/usr/bin/pgrep';
@@ -32,7 +34,7 @@ my $console_log = '/home/_multics/.shutdown-console.log';      # kept for debugg
 my $logout_daemons = 1;
 
 # Per-step timeouts in seconds. The worst case, with every retry used, is
-# about 420 s, which stays under daemon_timeout=450 in /etc/rc.d/multics.
+# about 445 s, which stays under daemon_timeout=450 in /etc/rc.d/multics.
 # A normal run takes well under a minute.
 my %T = (
     attention       => 5,     # wait for M-> after each ESC
@@ -40,12 +42,12 @@ my %T = (
     settle          => 2,     # pause after a prompt before typing (the console
                               # shows the prompt before its read is ready, and
                               # keys typed in that gap are dropped)
-    echo            => 3,     # wait for typed text to echo back
+    echo            => 6,     # wait for typed text to echo back (it can lag)
     type_tries      => 3,     # retype if it didn't echo
     logout_first    => 20,    # wait for the first LOGOUT line
     logout_quiet    => 5,     # done once no new LOGOUT for this long
-    logout_max      => 60,    # cap on the whole logout step
-    shutdown        => 120,   # 'shut' -> BCE prompt
+    logout_max      => 45,    # cap on the whole logout step
+    shutdown        => 100,   # 'shut' -> BCE prompt
     bce_attention   => 3,     # optional M-> after ESC at BCE
     die_wait        => 10,    # 'die' -> "really wish bce to die?"
     sim_wait        => 15,    # 'y'   -> sim> prompt
@@ -203,18 +205,35 @@ sub attention {
     return 0;
 }
 
+# Console output since byte offset $from in the log (escapes stripped).
+sub log_since {
+    my ($from) = @_;
+    open(my $fh, '<:raw', $console_log) or return '';
+    seek($fh, $from, 0);
+    local $/;
+    my $text = <$fh> // '';
+    close $fh;
+    $text =~ s/\e\[[0-9;?]*[A-Za-z]//g;
+    return $text;
+}
+
 # After 'logout * * *', the console says Ready right away but the LOGOUT
-# lines trickle in afterwards. Consider it done once they stop arriving.
+# lines trickle in afterwards. Count them straight from the log file since
+# the command was sent ($mark), so nothing else can consume them first, and
+# call it done once the count stops changing.
 sub wait_for_logouts {
+    my ($mark) = @_;
     my $end   = time + $T{logout_max};
-    my $count = 0;
+    my $last  = 0;
+    my $since = time;
     while (time < $end) {
-        my $wait = $count ? $T{logout_quiet} : $T{logout_first};
-        $wait = $end - time if $wait > $end - time;
-        last if wait_for($wait, $RE_LOGOUT) < 0;
-        $count++;
+        my $n = () = log_since($mark) =~ /$RE_LOGOUT/g;
+        ($last, $since) = ($n, time) if $n != $last;
+        last if time - $since >= ($last ? $T{logout_quiet} : $T{logout_first});
+        sleep 0.5;
     }
-    return $count;
+    drain();    # those lines are dealt with; start the next step clean
+    return $last;
 }
 
 # Work out where the console is right now, so a re-run after a partial
@@ -250,9 +269,14 @@ if ($state eq 'multics') {
         attention() or fail("no M-> prompt after ESC");
 
         print "-> Logging out daemons (logout * * *)...\n";
-        send_cmd('logout * * *', undef, undef, 1)
+        pump();
+        my $mark = $log_pos;
+        # Accepted if it echoes, or if its effects show up (Ready / LOGOUT),
+        # so a slow echo doesn't trigger a needless retype.
+        send_cmd('logout * * *',
+                 qr/logout \* \* \*|\bReady\b|$RE_LOGOUT/, undef, 1)
             or fail("'logout * * *' was not accepted by the console");
-        my $n = wait_for_logouts();
+        my $n = wait_for_logouts($mark);
         print "   $n daemon(s) logged out.\n";
     }
 
