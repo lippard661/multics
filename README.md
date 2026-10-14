@@ -4,6 +4,11 @@ This repository, originally for files and information related to
 using the DPS8M Multics simulator on OpenBSD, now also contains
 Unix-like tools for Multics and Multics-like tools for Unix.
 
+The file MIG.md is a Multics Informational Guide, originally written
+by Mark Davis for the Honeywell-sponsored Explorers Post 414 members
+to introduce them to Multics basics, now updated for the Multics
+simulator age.
+
 The main directory retains its original purpose. PL/I
 implementations of Unix-like tools are in the UnixOnMultics
 subdirectory and implementations of Multics-like tools
