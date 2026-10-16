@@ -75,7 +75,7 @@ alias loginmultics='/usr/bin/telnet localhost 6180;/usr/bin/reset'
 # Root aliases:
 ```
 alias startmultics='/usr/bin/rcctl start multics'
-alias stopmultics='/usr/bin/perl /usr/local/bin/shutdown_multics.pl'
+alias stopmultics='/usr/bin/rcctl stop multics'
 alias multicscons='/usr/bin/su -s /bin/sh _multics -c "/usr/bin/tmux attach-session -t multics"'
 ```
 
@@ -84,5 +84,6 @@ alias multicscons='/usr/bin/su -s /bin/sh _multics -c "/usr/bin/tmux attach-sess
 ```text
 multics:  rc.d/multics, for starting up Multics with "rcctl start multics"
 shutdown_multics.pl:  perl script to shut down Multics
+MIG.md:   Multics Informational Guide
 ```
 
