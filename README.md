@@ -18,8 +18,9 @@ Currently in UnixOnMultics: unix_patch.pl1, unix_diff.pl1,
 encode_base64.pl1, decode_base64.pl1, sha256.pl1,
 secure_hash_.pl1, and secure_hash_state.incl.pl1.
 
-Currently in MulticsOnUnix: abbrev.zsh (Multics abbrev
-for zsh; I'm currently using it on macOS)
+Currently in MulticsOnUnix: abbrev.zsh (Multics abbrev for zsh; I'm
+currently using it on macOS), links to Archive::Multics and MBasic
+(and explore, in Multics Basic).
 
 --
 
