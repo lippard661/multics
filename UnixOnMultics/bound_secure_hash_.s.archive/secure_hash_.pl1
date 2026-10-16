@@ -1,3 +1,9 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2026-09-22,Lippard), approve(2026-09-22,AML035):
+     Written.
+                                                   END HISTORY COMMENTS */
+
 /* *******************************************************
    *				    	       *
    * secure_hash_ -- SHA-256 message digest (FIPS 180-4) *
@@ -289,6 +295,26 @@ sha256_file:
 		a_code = code;
 		return;
 	     end;
+/* The rule $sha256_add enforces applies here too.  Under DENSE9 the octet
+   stream is defined on 72-bit groups, so a component whose bit count is not
+   a multiple of one can only be the last: were another to follow, the group
+   would be completed with zero bits that are in no component, and the
+   digest would be a value no other implementation could reproduce.  An
+   error is more use than such a digest.
+
+   The components are walked once to test that before any of them is
+   hashed.  Discovering it partway through would cost a segment's worth of
+   work to arrive at an error, and would leave the caller wondering how much
+   of the file had been read.				*/
+
+	     if a_mode = SHA_PACK_DENSE9
+	     then if ^groups_are_whole ()
+		then do;
+		     call msf_manager_$close (fcbp);
+		     a_code = error_table_$bad_arg;
+		     return;
+		end;
+
 	     do component = 0 by 1;
 		call msf_manager_$get_ptr (fcbp, component, "0"b, segp,
 		     bitcnt, code);
@@ -336,6 +362,34 @@ bit_to_hex:
 	return;
 
 /* * * * * * * * * * * *	internal procedures	* * * * * * * * * * * */
+
+/* groups_are_whole -- ON unless some component of the open multisegment
+   file has a bit count that is not a multiple of 72 and is followed by
+   another component.  Nothing is hashed here; only the bit counts are
+   read.							*/
+
+groups_are_whole:
+	proc returns (bit (1) aligned);
+
+dcl  comp fixed bin;
+dcl  bc fixed bin (24);
+dcl  p ptr;
+dcl  cd fixed bin (35);
+dcl  short_seen bit (1) aligned;
+
+	short_seen = "0"b;
+
+	do comp = 0 by 1;
+	     call msf_manager_$get_ptr (fcbp, comp, "0"b, p, bc, cd);
+	     if cd ^= 0 | p = null ()
+	     then return ("1"b);			/* that was the last one */
+	     if short_seen
+	     then return ("0"b);			/* one followed a short one */
+	     if mod (bc, 72) ^= 0
+	     then short_seen = "1"b;
+	end;
+
+     end groups_are_whole;
 
 setup:	proc (mode);
 

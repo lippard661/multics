@@ -1,5 +1,11 @@
 /* BEGIN INCLUDE FILE ... secure_hash_state.incl.pl1 */
 
+
+/****^  HISTORY COMMENTS:
+  1) change(2026-09-22,Lippard), approve(2026-09-22,AML035):
+     Written.
+                                                   END HISTORY COMMENTS */
+
 /* State for the incremental entries of secure_hash_.  The structure is of
    fixed size, so a caller may declare it automatic, internal static, or
    allocate it in an area:

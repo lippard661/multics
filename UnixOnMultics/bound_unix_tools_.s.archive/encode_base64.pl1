@@ -1,0 +1,486 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2026-09-22,Lippard), approve(2026-09-22,036):
+     Written.
+                                                   END HISTORY COMMENTS */
+
+/* encode_base64  input_file  output_file  {-control_args}
+ *
+ * Writes a base64 transcription of input_file to output_file.
+ * base64 uses only the characters  A-Z a-z 0-9 + /  with = for
+ * padding, and NO spaces or tabs -- so the result survives copy
+ * and paste between Multics systems intact: none of its bytes
+ * are the erase, kill, or escape characters, and there is no
+ * whitespace for terminal canonicalization to rewrite.  Move the
+ * output to another system by any means, then decode_base64 it
+ * to recover the original file byte for byte.
+ *
+ * The transcription is wrapped at 64 characters per line; the
+ * decoder ignores those line breaks (and any other whitespace).
+ *
+ * Two derivations of octets from Multics storage are provided.
+ * Under -byte8, the default, each 9-bit character is transferred
+ * as its low 8 bits, which is exact for ordinary text (7-bit
+ * ASCII) and loses the ninth bit of anything else.  Under
+ * -dense9 the storage is converted by convert_dense9_$pack, two
+ * words to nine octets, and nothing is lost; that is the
+ * derivation for object segments and other native binary.
+ *
+ * Under -byte8 a warning is written if the input has a ninth bit
+ * set anywhere, or a bit count that is not a multiple of nine,
+ * since either means the transcription is leaving something
+ * behind.  The warning comes before the output segment is made,
+ * so the command can be abandoned rather than undone.
+ *
+ * A -dense9 transcription begins with a header line
+ *
+ *    -dense9 BITCOUNT
+ *
+ * because the bit count cannot be recovered from the octets: nine
+ * of them could have come from anything between 1 and 72 bits.
+ * decode_base64 reads that line and restores the bit count, so it
+ * needs no control argument of its own.  A transcription without
+ * such a line is byte8, as before, and files already made by this
+ * command are unaffected.
+ *
+ * Line width is kept under 72 columns for the card reader.
+ *
+ * Written 22 September 2026 by Claude Opus 4.8 at the direction
+ * of Jim Lippard.  -dense9 added 24 September 2026, and the
+ * warnings above 25 September 2026, by Claude Opus 5.0 at the
+ * same direction.
+ */
+
+encode_base64:
+   proc options (main);
+
+   dcl hcs_$initiate_count entry
+      (char(*), char(*), char(*), fixed bin(24),
+       fixed bin(2), ptr, fixed bin(35));
+   dcl hcs_$make_seg entry
+      (char(*), char(*), char(*), fixed bin(5),
+       ptr, fixed bin(35));
+   dcl hcs_$set_bc_seg       entry (ptr, fixed bin(24),
+                                    fixed bin(35));
+   dcl hcs_$truncate_seg     entry (ptr, fixed bin(24),
+                                    fixed bin(35));
+   dcl hcs_$terminate_noname entry (ptr, fixed bin(35));
+   dcl cu_$arg_count entry (fixed bin, fixed bin(35));
+   dcl cu_$arg_ptr   entry (fixed bin, ptr, fixed bin(21),
+                            fixed bin(35));
+   dcl expand_pathname_ entry (char(*), char(*), char(*),
+                               fixed bin(35));
+   dcl convert_dense9_$pack entry (ptr, fixed bin(24), ptr,
+                                   fixed bin(24), fixed bin(24),
+                                   fixed bin(35));
+   dcl hcs_$status_ entry (char(*), char(*), fixed bin(1), ptr, ptr,
+                           fixed bin(35));
+   dcl com_err_ entry options (variable);
+   dcl ioa_$rsnnl entry options (variable);
+   dcl command_query_$yes_no entry options (variable);
+   dcl secure_hash_$sha256_octets entry (ptr, fixed bin(24), fixed bin,
+                                         bit(256) aligned, fixed bin(35));
+   dcl secure_hash_$bit_to_hex entry (bit(*) aligned, char(*),
+                                      fixed bin(35));
+
+   dcl error_table_$badopt fixed bin(35) ext static;
+
+   dcl (addr, addrel, byte, divide, length, mod, null, rank,
+        rtrim, substr) builtin;
+
+   dcl (in_dir, out_dir) char (168);
+   dcl (in_ent, out_ent) char (32);
+   dcl (in_ptr, tgt_ptr) ptr;
+   dcl (in_len, out_len) fixed bin (24);
+   dcl in_buf  char (in_len) based (in_ptr);
+   dcl tgt_seg char (OUT_MAX) based (tgt_ptr);
+
+   dcl argp    ptr;
+   dcl argl    fixed bin (21);
+   dcl arg_str char (argl) based (argp);
+   dcl code    fixed bin (35);
+   dcl (nargs, argno, npaths) fixed bin;
+   dcl col     fixed bin (24);
+   dcl dense9  bit (1);
+   dcl in_bits fixed bin (24);
+   dcl (done_bits, chunk_bits, nocts) fixed bin (24);
+   dcl (nwords, w, t) fixed bin (24);
+   dcl tail_bits fixed bin;
+   dcl high_bit bit (1);
+   dcl in_words (nwords) bit (36) aligned based (in_ptr);
+   dcl NINTH_BITS bit (36) aligned int static options (constant)
+      init ("100000000100000000100000000100000000"b);
+   dcl hdr     char (96);
+   dcl hdr_len fixed bin (21);
+   dcl digest_sw bit (1);
+   dcl hex     char (64);
+   dcl j       fixed bin;
+   dcl ALPHA char (64);
+
+   /* One packing buffer, 512 groups of 72 bits: 36864 bits of
+    * storage, 4608 octets, 1024 words.  The storage is converted
+    * a buffer at a time so that no temporary segment is needed.
+    * A whole number of groups is also a whole number of words, so
+    * the pointer to each piece is formed by addrel.
+    */
+   dcl PACK_BITS   fixed bin (24) int static options (constant)
+                             init (36864);        /* 512 * 72 */
+   dcl PACK_OCTETS fixed bin (24) int static options (constant)
+                             init (4608);         /* 512 *  9 */
+   dcl pack_buf char (4608) aligned;              /* PACK_OCTETS */
+
+   dcl OUT_MAX  fixed bin (24) int static options (constant)
+                             init (1044480);
+   dcl RW_ACCESS fixed bin (5) int static options (constant)
+                             init (01010b);
+   dcl LINEW fixed bin int static options (constant) init (64);
+   dcl USAGE char (43) int static options (constant)
+      init ("Usage: encode_base64 input_file output_file");
+   dcl OPTS char (50) int static options (constant)
+      init ("{-byte8 | -dense9} {-force} {-digest | -no_digest}");
+   dcl force_sw bit (1);
+   dcl sb_area (20) fixed bin (35) aligned;
+   dcl NL char (1);
+
+   /* ------------------------------------------------------- */
+   NL = byte (10);
+   in_ptr  = null ();
+   tgt_ptr = null ();
+   dense9  = "0"b;
+   force_sw = "0"b;
+   digest_sw = "1"b;
+   npaths  = 0;
+   ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl"
+        || "mnopqrstuvwxyz0123456789+/";
+
+   call cu_$arg_count (nargs, code);
+   do argno = 1 to nargs;
+      call cu_$arg_ptr (argno, argp, argl, code);
+      if argl > 0 then
+         if substr (arg_str, 1, 1) = "-" then do;
+            if arg_str = "-dense9" | arg_str = "-d9" then
+               dense9 = "1"b;
+            else if arg_str = "-byte8" | arg_str = "-b8" then
+               dense9 = "0"b;
+            else if arg_str = "-force" | arg_str = "-fc" then
+               force_sw = "1"b;
+            else if arg_str = "-digest" | arg_str = "-dg" then
+               digest_sw = "1"b;
+            else if arg_str = "-no_digest" | arg_str = "-ndg" then
+               digest_sw = "0"b;
+            else do;
+               call com_err_ (error_table_$badopt, "encode_base64",
+                  "^a", arg_str);
+               return;
+            end;
+            go to next_arg;
+         end;
+      npaths = npaths + 1;
+      if npaths = 1 then
+         call expand_pathname_ (arg_str, in_dir, in_ent, code);
+      else if npaths = 2 then
+         call expand_pathname_ (arg_str, out_dir, out_ent, code);
+      else do;
+         call com_err_ (0, "encode_base64", "^a^/   ^a", USAGE, OPTS);
+         return;
+      end;
+      if code ^= 0 then do;
+         call com_err_ (code, "encode_base64",
+            "Cannot resolve ^a", arg_str);
+         return;
+      end;
+next_arg:
+   end;
+
+   if npaths ^= 2 then do;
+      call com_err_ (0, "encode_base64", "^a^/   ^a", USAGE, OPTS);
+      return;
+   end;
+
+   if ^force_sw then call confirm_overwrite;
+
+   call hcs_$initiate_count (in_dir, in_ent, "", in_bits, 0,
+                             in_ptr, code);
+   if in_ptr = null () then do;
+      call com_err_ (code, "encode_base64",
+         "Could not initiate input ^a>^a",
+         rtrim (in_dir), rtrim (in_ent));
+      return;
+   end;
+   in_len = divide (in_bits, 9, 24, 0);
+
+   /* ---- Under -byte8 the ninth bit of every character is
+    *      discarded, and so is a trailing run of fewer than nine
+    *      bits.  Neither loses anything for ordinary text.  Warn
+    *      if either would lose something here -- before the
+    *      output segment exists, so the transcription can be
+    *      abandoned rather than undone.  The ninth bits are
+    *      tested a word at a time, which is four times cheaper
+    *      than testing each character, and the odd characters at
+    *      the end are tested singly.
+    */
+   if ^dense9 then do;
+      nwords = divide (in_bits, 36, 24, 0);
+      high_bit = "0"b;
+      do w = 1 to nwords while (^high_bit);
+         if (in_words (w) & NINTH_BITS) ^= "0"b then high_bit = "1"b;
+      end;
+      do t = 4 * nwords + 1 to in_len;
+         if rank (substr (in_buf, t, 1)) > 255 then high_bit = "1"b;
+      end;
+      if high_bit then
+         call com_err_ (0, "encode_base64",
+            "Warning: ^a has a ninth bit set;^/the transcription carries only the low eight bits of^/each byte.  Use -dense9 for native binary.",
+            rtrim (in_ent));
+      tail_bits = mod (in_bits, 9);
+      if tail_bits ^= 0 then
+         call com_err_ (0, "encode_base64",
+            "Warning: the bit count of ^a^/is not a multiple of nine, so its last ^d bit^[s^;^] will^/not be transcribed.  Use -dense9 to carry the whole^/segment.",
+            rtrim (in_ent), tail_bits, (tail_bits ^= 1));
+   end;
+
+   call hcs_$make_seg (out_dir, out_ent, "", RW_ACCESS,
+                       tgt_ptr, code);
+   if tgt_ptr = null () then do;
+      call com_err_ (code, "encode_base64",
+         "Could not create output ^a>^a",
+         rtrim (out_dir), rtrim (out_ent));
+      go to cleanup;
+   end;
+   call hcs_$truncate_seg (tgt_ptr, 0, code);
+   out_len = 0;
+   col     = 0;
+
+   call put_header;
+
+   if ^dense9 then
+      call encode_octets (in_ptr, in_len);
+
+   else do;
+      /* ---- convert and encode one buffer at a time.  Each
+       *      buffer holds a whole number of 72-bit groups, hence
+       *      a number of octets divisible by three, so no quartet
+       *      ever straddles two buffers and no "=" padding can
+       *      appear before the end.
+       */
+      done_bits = 0;
+      do while (done_bits < in_bits);
+         chunk_bits = in_bits - done_bits;
+         if chunk_bits > PACK_BITS then chunk_bits = PACK_BITS;
+         call convert_dense9_$pack
+            (addrel (in_ptr, divide (done_bits, 36, 24, 0)),
+             chunk_bits, addr (pack_buf), PACK_OCTETS, nocts, code);
+         if code ^= 0 then do;
+            call com_err_ (code, "encode_base64",
+               "Packing at bit ^d.", done_bits);
+            go to cleanup;
+         end;
+         call encode_octets (addr (pack_buf), nocts);
+         done_bits = done_bits + chunk_bits;
+      end;
+   end;
+
+   if col > 0 then call put (NL);
+
+   call hcs_$set_bc_seg (tgt_ptr, out_len * 9, code);
+   call hcs_$truncate_seg (tgt_ptr,
+                           divide (out_len + 3, 4, 24, 0), code);
+   call hcs_$terminate_noname (tgt_ptr, code);
+
+cleanup:
+   if in_ptr ^= null () then
+      call hcs_$terminate_noname (in_ptr, code);
+   return;
+
+
+/* ---- The header.  Zero, one or two lines, each beginning with
+ *      a minus sign, which base64 text never does:
+ *
+ *         -dense9 BITCOUNT     the derivation, dense9 only
+ *         -byte8               the derivation, only with a digest
+ *         -sha256 DIGEST       of the octets this file carries
+ *
+ *      A byte8 transcription with -no_digest therefore has no
+ *      header at all, which is the format as it stood before the
+ *      digest existed, and a dense9 one has the single line it
+ *      always had.  Lines are kept under 72 columns, which is why
+ *      the digest is a line of its own rather than a field on the
+ *      derivation line.
+ */
+put_header:
+   proc;
+
+   if dense9 then do;
+      call ioa_$rsnnl ("-dense9 ^d", hdr, hdr_len, in_bits);
+      call put_header_line;
+   end;
+   else if digest_sw then do;
+      hdr = "-byte8";
+      hdr_len = 6;
+      call put_header_line;
+   end;
+
+   if digest_sw then do;
+      call compute_digest;
+      call ioa_$rsnnl ("-sha256 ^a", hdr, hdr_len, hex);
+      call put_header_line;
+   end;
+   end put_header;
+
+put_header_line:
+   proc;
+   dcl k fixed bin (21);
+
+   do k = 1 to hdr_len;
+      call put_raw (substr (hdr, k, 1));
+   end;
+   call put_raw (NL);
+   end put_header_line;
+
+
+/* ---- Append one character without wrapping the line.  Header
+ *      lines are not base64 and must not be broken: a -sha256
+ *      line is 72 columns, and putting it through put wrapped it
+ *      at LINEW, which split the digest in two and left eight
+ *      hexadecimal characters at the head of the body where the
+ *      decoder took them for data.  Those eight characters are
+ *      all valid base64, so nothing complained.
+ */
+put_raw:
+   proc (ch);
+   dcl ch char (1);
+
+   if out_len >= OUT_MAX then do;
+      call com_err_ (0, "encode_base64",
+         "Encoded output exceeds one segment.");
+      go to cleanup;
+   end;
+   substr (tgt_seg, out_len + 1, 1) = ch;
+   out_len = out_len + 1;
+   if ch = NL then col = 0;
+   end put_raw;
+
+
+/* ---- The digest of the octets this transcription carries, which
+ *      is the digest of the input storage under the very
+ *      derivation being used: the dense9 packing of the storage
+ *      is the octet stream.  So this is the number that sha256
+ *      prints for the input with the same control argument, and
+ *      the number that shasum reports for the decoded file on a
+ *      system that counts in octets.
+ *
+ *      Under -byte8 with a ninth bit set, secure_hash_ returns
+ *      error_table_$bad_conversion.  The digest is still right
+ *      for the octets that were hashed, which are the octets this
+ *      file carries, and the loss has already been reported
+ *      above, so the code is not examined here.
+ */
+compute_digest:
+   proc;
+   dcl mode fixed bin;
+   dcl dg   bit (256) aligned;
+   dcl cd   fixed bin (35);
+
+   if dense9 then mode = SHA_PACK_DENSE9;
+             else mode = SHA_PACK_BYTE8;
+   call secure_hash_$sha256_octets (in_ptr, in_bits, mode, dg, cd);
+   call secure_hash_$bit_to_hex (dg, hex, cd);
+   end compute_digest;
+
+
+/* ---- Ask before replacing an output segment that is already
+ *      there.  The question comes before anything is read, so a
+ *      refusal costs nothing.  -force skips it, and an exec_com
+ *      can drive it either way with the answer command.
+ */
+confirm_overwrite:
+   proc;
+   dcl yes_sw bit (1);
+   dcl qcode  fixed bin (35);
+   dcl cd     fixed bin (35);
+
+   status_ptr = addr (sb_area);
+   call hcs_$status_ (out_dir, out_ent, 1, status_ptr, null (), cd);
+   if cd ^= 0 then return;      /* not there, or not ours to see */
+   qcode = 0;
+   call command_query_$yes_no (yes_sw, qcode, "encode_base64",
+      "^a>^a already exists.  Answering yes truncates it and writes^/the new contents over it.  Answering no stops the command.",
+      "Do you want to overwrite ^a>^a?",
+      rtrim (out_dir), rtrim (out_ent));
+   if ^yes_sw then go to cleanup;
+   end confirm_overwrite;
+
+
+/* ---- Encode n octets, three at a time.  Only the low eight bits
+ *      of each character are taken, which is the byte8 derivation
+ *      when the characters are the file itself and is exact when
+ *      they came from convert_dense9_$pack, whose ninth bits are
+ *      zero.  A count that is not a multiple of three pads with
+ *      "=", so a caller that encodes in pieces must give whole
+ *      multiples of three in every call but the last.
+ */
+encode_octets:
+   proc (p, n);
+   dcl p ptr;
+   dcl n fixed bin (24);
+   dcl src char (n) based (p);
+   dcl (i, nb, v, g0, g1, g2, g3) fixed bin (24);
+   dcl (b0, b1, b2)               fixed bin (24);
+
+   i = 1;
+   do while (i <= n);
+      nb = n - i + 1;
+      if nb > 3 then nb = 3;
+      b0 = mod (rank (substr (src, i, 1)), 256);
+      if nb >= 2 then b1 = mod (rank (substr (src, i+1, 1)), 256);
+                 else b1 = 0;
+      if nb >= 3 then b2 = mod (rank (substr (src, i+2, 1)), 256);
+                 else b2 = 0;
+      v  = b0 * 65536 + b1 * 256 + b2;
+      g0 = divide (v, 262144, 24, 0);
+      g1 = mod (divide (v, 4096, 24, 0), 64);
+      g2 = mod (divide (v, 64, 24, 0), 64);
+      g3 = mod (v, 64);
+      call put (substr (ALPHA, g0 + 1, 1));
+      call put (substr (ALPHA, g1 + 1, 1));
+      if nb >= 2 then call put (substr (ALPHA, g2 + 1, 1));
+                 else call put ("=");
+      if nb >= 3 then call put (substr (ALPHA, g3 + 1, 1));
+                 else call put ("=");
+      i = i + 3;
+   end;
+   end encode_octets;
+
+
+/* ---- Append one character, wrapping the line at LINEW. ---- */
+put:
+   proc (ch);
+   dcl ch char (1);
+
+   if out_len >= OUT_MAX then do;
+      call com_err_ (0, "encode_base64",
+         "Encoded output exceeds one segment.");
+      go to cleanup;
+   end;
+   substr (tgt_seg, out_len + 1, 1) = ch;
+   out_len = out_len + 1;
+   if ch = NL then col = 0;
+   else do;
+      col = col + 1;
+      if col >= LINEW then do;
+         if out_len >= OUT_MAX then do;
+            call com_err_ (0, "encode_base64",
+               "Encoded output exceeds one segment.");
+            go to cleanup;
+         end;
+         substr (tgt_seg, out_len + 1, 1) = NL;
+         out_len = out_len + 1;
+         col = 0;
+      end;
+   end;
+   end put;
+
+%include status_structures;
+%include secure_hash_state;
+
+end encode_base64;

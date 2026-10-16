@@ -1,0 +1,185 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2026-09-24,Lippard), approve(2026-09-24,AML037):
+     Written.
+  2) change(2026-09-24,Lippard), approve(2026-09-24,AML):
+     Written, provide subroutine to convert Multics files to dense9 format for
+     use outside Multics, or external dense9 format files back to Multics
+     format.
+                                                   END HISTORY COMMENTS */
+
+/* *********************************************************
+   *							   *
+   * convert_dense9_ -- Multics storage to octets and back  *
+   *							   *
+   ********************************************************* */
+
+/* Written:	24 September 2026 by Claude Opus 5.0 at the direction
+		of Jim Lippard.					*/
+
+/* A Multics word is 36 bits and the rest of the world counts in octets, so
+   any exchange of native binary has to say how the one becomes the other.
+   This subroutine performs the lossless derivation: the storage is taken as
+   a bit string, padded on the right with zeros to a multiple of 72 bits, and
+   each 72-bit group becomes nine octets, the most significant bit of the
+   group first.  Two words become nine octets exactly, and nothing is
+   discarded.
+
+   This is the derivation secure_hash_ applies internally for
+   SHA_PACK_DENSE9, so a segment packed by $pack and hashed anywhere else
+   has the digest that the sha256 command prints for it under -dense9.  That
+   correspondence is the test of both programs, and it is the reason the
+   group is 72 bits rather than 8 or 36: a group of 72 bits is a whole
+   number of words and a whole number of octets at the same time, and no
+   smaller quantity is both.
+
+   The bit count travels separately.  Nine octets could have come from
+   anything between 1 and 72 bits, so an octet count cannot express the
+   length of what it holds, and $unpack takes the bit count as an input
+   rather than deducing one.  Anything that carries Multics storage in this
+   form -- a file, a message, an archive member -- has to carry the bit count
+   with it.
+
+   Speed.  Nine bit-string moves are made per group in each direction, which
+   is what the repacking costs; there is no arithmetic in the loops.  A
+   caller with a large segment should convert it in pieces rather than
+   demanding an output area the size of the whole, and the pieces may be any
+   whole number of groups, since a group boundary is also a word boundary
+   and the digest and the packing both depend only on the concatenation.  */
+
+/* format: style2 */
+
+convert_dense9_: proc;
+
+	return;					/* not an entry point */
+
+/* Parameters */
+
+dcl  a_in_ptr ptr parameter;
+dcl  a_out_ptr ptr parameter;
+dcl  a_bit_count fixed bin (24) parameter;
+dcl  a_octet_count fixed bin (24) parameter;
+dcl  a_octet_max fixed bin (24) parameter;
+dcl  a_code fixed bin (35) parameter;
+
+/* Automatic */
+
+dcl  inp ptr;
+dcl  outp ptr;
+dcl  nbits fixed bin (24);				/* bits of storage */
+dcl  noctets fixed bin (24);				/* octets */
+dcl  nobits fixed bin (24);				/* 9 * noctets */
+dcl  ngroups fixed bin (24);
+dcl  navail fixed bin;
+dcl  i fixed bin (24);				/* a segment holds 130560 groups */
+dcl  j fixed bin;
+dcl  group bit (72) aligned;
+
+/* The storage, seen as bits, and the octets, seen as the nine-bit bytes that
+   hold them.  An octet occupies the low eight bits of its byte; the ninth,
+   which is the high bit, is zero on output and ignored on input.	*/
+
+dcl  in_storage bit (nbits) based (inp);
+dcl  out_storage bit (nbits) based (outp);
+dcl  in_octets bit (nobits) based (inp);
+dcl  out_octets bit (nobits) based (outp);
+
+/* Entries */
+
+dcl  error_table_$bad_arg fixed bin (35) ext static;
+dcl  error_table_$smallarg fixed bin (35) ext static;
+
+/* Builtins */
+
+dcl (divide, min, null, substr) builtin;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/* pack -- storage to octets.  The octet count is determined by the bit
+   count, and is returned even when the output area is too small, so that a
+   caller may ask for the size before providing the room.		*/
+
+pack:
+	entry (a_in_ptr, a_bit_count, a_out_ptr, a_octet_max, a_octet_count,
+	     a_code);
+
+	a_code = 0;
+	a_octet_count = 0;
+	nbits = a_bit_count;
+	if nbits < 0 | a_octet_max < 0
+	then goto bad_arg;
+
+	ngroups = divide (nbits + 71, 72, 24, 0);
+	noctets = 9 * ngroups;
+	a_octet_count = noctets;
+
+	if noctets > a_octet_max
+	then do;
+	     a_code = error_table_$smallarg;
+	     return;
+	end;
+	if noctets = 0 then return;
+
+	inp = a_in_ptr;
+	outp = a_out_ptr;
+	if inp = null () | outp = null ()
+	then goto bad_arg;
+
+	nobits = 9 * noctets;
+
+	do i = 1 to ngroups;
+	     group = "0"b;				/* zero fill a short group */
+	     navail = min (72, nbits - (i - 1) * 72);
+	     substr (group, 1, navail) =
+		substr (in_storage, (i - 1) * 72 + 1, navail);
+	     do j = 1 to 9;
+		substr (out_octets, 81 * (i - 1) + 9 * j - 8, 9) =
+		     "0"b || substr (group, 8 * j - 7, 8);
+	     end;
+	end;
+
+	return;
+
+/* unpack -- octets to storage.  The bit count is an input: it cannot be
+   recovered from the octet count, and the two must agree exactly, so that a
+   stream truncated or joined to another is reported rather than quietly
+   delivering the wrong length.					*/
+
+unpack:
+	entry (a_in_ptr, a_octet_count, a_out_ptr, a_bit_count, a_code);
+
+	a_code = 0;
+	nbits = a_bit_count;
+	noctets = a_octet_count;
+	if nbits < 0 | noctets < 0
+	then goto bad_arg;
+
+	ngroups = divide (nbits + 71, 72, 24, 0);
+	if noctets ^= 9 * ngroups
+	then goto bad_arg;
+	if nbits = 0 then return;
+
+	inp = a_in_ptr;
+	outp = a_out_ptr;
+	if inp = null () | outp = null ()
+	then goto bad_arg;
+
+	nobits = 9 * noctets;
+
+	do i = 1 to ngroups;
+	     do j = 1 to 9;
+		substr (group, 8 * j - 7, 8) =
+		     substr (in_octets, 81 * (i - 1) + 9 * j - 7, 8);
+	     end;
+	     navail = min (72, nbits - (i - 1) * 72);
+	     substr (out_storage, (i - 1) * 72 + 1, navail) =
+		substr (group, 1, navail);
+	end;
+
+	return;
+
+bad_arg:
+	a_code = error_table_$bad_arg;
+	return;
+
+     end convert_dense9_;

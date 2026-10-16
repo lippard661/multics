@@ -1,0 +1,897 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2026-09-27,Lippard), approve(2026-09-27,AML038):
+     Written.
+  2) change(2026-10-06,Lippard), approve(2026-10-06,AML):
+     Fix history comment to note addition of overwrite protection
+     and -force.
+                                                   END HISTORY COMMENTS */
+
+/* *********************************************************
+   *					         *
+   * gzip -- compress a segment into the gzip file format  *
+   *					         *
+   ********************************************************* */
+
+/* Written:	27 September 2026 by Claude Opus 5.0 at the direction
+		of Jim Lippard.					*/
+
+/* The output is a gzip file as defined by RFC 1952, holding a DEFLATE
+   stream as defined by RFC 1951, so gunzip on any system will read it.  It
+   is written one octet to a nine-bit character with the ninth bit zero, so
+   the result is byte8-clean: encode_base64 carries it with no control
+   argument and no header, and sha256 on it gives the value that the far
+   system's sha256 gives the .gz.
+
+   Octet derivation.  SHA-256 has the same problem and solves it the same
+   way; see secure_hash_.info.  What is new here is that the choice can be
+   made automatically, because the container records it and gunzip restores
+   whichever was used.  BYTE8 is chosen when no ninth bit is set and the bit
+   count is a multiple of nine, since it then loses nothing; DENSE9
+   otherwise.
+
+   That is worth doing rather than defaulting, because the derivation
+   dominates the compression ratio.  A repeated string of characters
+   beginning at character p lands at bit 9p of the DENSE9 octets, so two
+   occurrences are only aligned when their positions differ by a multiple of
+   eight characters and seven matches in eight are invisible to the
+   compressor.  Measured on text, DENSE9 compresses about seven times worse
+   than BYTE8.  An archive of source is ASCII with its ninth bits zero and
+   its bit count a multiple of 36, so it is compressed BYTE8 and gets the
+   good ratio; only a bound archive needs DENSE9.
+
+   The bit count travels in the stored file name, as ENTRYNAME.BITS.dense9,
+   because no field of the gzip format holds a bit count and the name is
+   the only header field other systems' tools propagate.  See gzip.info,
+   and see put_header for why it is not in an extra field.
+
+   Blocks.  Only stored and fixed-Huffman blocks are produced.  Dynamic
+   Huffman would compress perhaps a fifth better; it needs the canonical
+   code construction and the code-length alphabet, and can be added later
+   without changing the format or gunzip.  Matches are found greedily rather
+   than lazily, which costs a few per cent more.  If the fixed-Huffman
+   stream comes out no smaller than the input, the whole thing is emitted
+   again as stored blocks, so the output never grows by more than five
+   octets per 65535.
+
+   Speed.  The search follows at most CHAIN hash-chain entries per position.
+   Measured on text, a limit of 4 gives 16.6 per cent, 32 gives 15.4, and
+   256 gives 15.2, so the default is 32: past that the search costs eight
+   times as much for one per cent.  -level sets it.			*/
+
+/* format: style2 */
+
+gzip:	proc options (main);
+
+/* Entries */
+
+dcl  hcs_$initiate_count entry (char (*), char (*), char (*), fixed bin (24),
+	fixed bin (2), ptr, fixed bin (35));
+dcl  hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr,
+	fixed bin (35));
+dcl  hcs_$set_bc_seg entry (ptr, fixed bin (24), fixed bin (35));
+dcl  hcs_$truncate_seg entry (ptr, fixed bin (24), fixed bin (35));
+dcl  hcs_$terminate_noname entry (ptr, fixed bin (35));
+dcl  hcs_$status_ entry (char (*), char (*), fixed bin (1), ptr, ptr,
+	fixed bin (35));
+dcl  cu_$arg_count entry (fixed bin, fixed bin (35));
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+dcl  expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+dcl  get_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+dcl  release_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+dcl  convert_dense9_$pack entry (ptr, fixed bin (24), ptr, fixed bin (24),
+	fixed bin (24), fixed bin (35));
+dcl  com_err_ entry () options (variable);
+dcl  ioa_$rsnnl entry () options (variable);
+dcl  command_query_$yes_no entry () options (variable);
+
+dcl  error_table_$badopt fixed bin (35) ext static;
+dcl  error_table_$bad_arg fixed bin (35) ext static;
+dcl  error_table_$noarg fixed bin (35) ext static;
+dcl  error_table_$too_many_args fixed bin (35) ext static;
+
+/* Builtins */
+
+dcl (addr, addrel, binary, bool, byte, divide, index, length, min, mod, null,
+	rank, rtrim, substr, unspec) builtin;
+
+/* Constants */
+
+dcl  ME char (4) int static options (constant) init ("gzip");
+
+dcl  WSIZE fixed bin (24) int static options (constant) init (32768);
+dcl  HSIZE fixed bin (24) int static options (constant) init (32768);
+dcl  MINM fixed bin int static options (constant) init (3);
+dcl  MAXM fixed bin int static options (constant) init (258);
+
+/* The largest input.  Fixed-Huffman coding can reach nine bits an octet, so
+   MAX_OCT is chosen to keep the bit stream inside one segment even in that
+   case: 900000 * 9 is 8100000, and STRM_BITS is 8388608.		*/
+
+dcl  MAX_OCT fixed bin (24) int static options (constant) init (900000);
+dcl  STRM_BITS fixed bin (24) int static options (constant) init (8388608);
+dcl  OUT_MAX fixed bin (24) int static options (constant) init (1044480);
+dcl  RW_ACCESS fixed bin (5) int static options (constant) init (01010b);
+
+dcl  CHAIN (9) fixed bin int static options (constant)
+	init (2, 4, 8, 16, 32, 64, 128, 256, 512);
+dcl  DEFAULT_LEVEL fixed bin int static options (constant) init (5);
+
+dcl  AND bit (4) aligned int static options (constant) init ("0001"b);
+dcl  AND_NOT bit (4) aligned int static options (constant) init ("0010"b);
+dcl  XOR bit (4) aligned int static options (constant) init ("0110"b);
+
+dcl  NINTH_BITS bit (36) aligned int static options (constant)
+	init ("100000000100000000100000000100000000"b);
+
+/* Microseconds from 0000 GMT 1 January 1901, which the Multics clock counts
+   from, to 0000 GMT 1 January 1970, which RFC 1952 counts from: 25202 days.
+   A directory date holds the clock with its low sixteen bits dropped, so it
+   is good to about 65 milliseconds, and MTIME wants whole seconds.	*/
+
+dcl  EPOCH_1901 fixed bin (71) int static options (constant)
+	init (2177452800000000);
+
+dcl  CRC_POLY bit (32) aligned int static options (constant)
+	init ("11101101101110001000001100100000"b);	/* edb88320 */
+
+/* The length and distance codes of RFC 1951, section 3.2.5. */
+
+dcl  LEN_BASE (0:28) fixed bin int static options (constant)
+	init (3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35,
+	43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258);
+dcl  LEN_EXTRA (0:28) fixed bin int static options (constant)
+	init (0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+	4, 4, 4, 4, 5, 5, 5, 5, 0);
+dcl  DST_BASE (0:29) fixed bin (24) int static options (constant)
+	init (1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+	257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193,
+	12289, 16385, 24577);
+dcl  DST_EXTRA (0:29) fixed bin int static options (constant)
+	init (0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+	9, 9, 10, 10, 11, 11, 12, 12, 13, 13);
+
+/* Automatic */
+
+dcl (in_dir, out_dir) char (168);
+dcl (in_ent, out_ent) char (32);
+dcl (in_ptr, out_ptr) ptr;
+dcl  in_bits fixed bin (24);
+dcl  in_len fixed bin (24);				/* whole characters */
+dcl  in_words fixed bin (24);
+dcl  nfull fixed bin (24);				/* whole words */
+dcl  out_len fixed bin (24);				/* octets written */
+
+dcl  argp ptr;
+dcl  argl fixed bin (21);
+dcl  arg char (argl) based (argp);
+dcl  code fixed bin (35);
+dcl (nargs, argno, npaths, level) fixed bin;
+dcl  skip_next bit (1) aligned;
+dcl  force_sw bit (1) aligned;
+dcl  dense9 bit (1) aligned;
+dcl  auto_sw bit (1) aligned;
+dcl  high_bit bit (1) aligned;
+dcl  chain fixed bin;
+
+dcl  tsp (3) ptr;
+dcl  octp ptr;					/* -> the octet form */
+dcl  strmp ptr;					/* -> the bit stream */
+dcl  headp ptr;
+dcl  prevp ptr;
+
+dcl  noct fixed bin (24);				/* octets to compress */
+dcl  bp fixed bin (24);				/* bits in the stream */
+dcl  crc bit (32) aligned;
+
+dcl  fname char (72);
+dcl  fname_len fixed bin (21);
+dcl (i, k, t) fixed bin (24);
+
+dcl  sb_area (20) fixed bin (35) aligned;		/* for hcs_$status_ */
+dcl  clk fixed bin (71);
+dcl  mtime fixed bin (35);
+dcl  scode fixed bin (35);
+
+dcl  REV8 (0:255) fixed bin (24);
+dcl  CRCTAB (0:255) bit (32) aligned;
+
+/* Based */
+
+dcl  in_buf char (in_len) based (in_ptr);
+dcl  in_word (in_words) bit (36) aligned based (in_ptr);
+dcl  oct char (noct) based (octp);
+dcl  oct_word (in_words) bit (36) aligned based (octp);
+dcl  strm bit (STRM_BITS) aligned based (strmp);
+dcl  head (0:32767) fixed bin (24) based (headp);
+dcl  prev (0:32767) fixed bin (24) based (prevp);
+dcl  out_seg char (OUT_MAX) based (out_ptr);
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+	in_ptr = null ();
+	out_ptr = null ();
+	tsp (*) = null ();
+	npaths = 0;
+	level = DEFAULT_LEVEL;
+	auto_sw = "1"b;
+	dense9 = "0"b;
+	skip_next = "0"b;
+	force_sw = "0"b;
+
+	call cu_$arg_count (nargs, code);
+
+	do argno = 1 to nargs;
+	     if skip_next
+	     then do;
+		skip_next = "0"b;
+		goto next_arg;
+	     end;
+	     call cu_$arg_ptr (argno, argp, argl, code);
+	     if argl > 0
+	     then if substr (arg, 1, 1) = "-"
+		then do;
+		     if arg = "-byte8" | arg = "-b8"
+		     then do;
+			auto_sw = "0"b;
+			dense9 = "0"b;
+		     end;
+		     else if arg = "-dense9" | arg = "-d9"
+		     then do;
+			auto_sw = "0"b;
+			dense9 = "1"b;
+		     end;
+		     else if arg = "-force" | arg = "-fc"
+		     then force_sw = "1"b;
+		     else if arg = "-level" | arg = "-lvl"
+		     then do;
+			if argno = nargs
+			then do;
+			     call com_err_ (error_table_$noarg, ME, "^a", arg);
+			     return;
+			end;
+			call cu_$arg_ptr (argno + 1, argp, argl, code);
+			level = cv_level ();
+			if level = 0 then return;
+			skip_next = "1"b;
+		     end;
+		     else do;
+			call com_err_ (error_table_$badopt, ME, "^a", arg);
+			return;
+		     end;
+		     goto next_arg;
+		end;
+	     npaths = npaths + 1;
+	     if npaths = 1
+	     then call expand_pathname_ (arg, in_dir, in_ent, code);
+	     else if npaths = 2
+	     then call expand_pathname_ (arg, out_dir, out_ent, code);
+	     else do;
+		call com_err_ (error_table_$too_many_args, ME, "^a", arg);
+		return;
+	     end;
+	     if code ^= 0
+	     then do;
+		call com_err_ (code, ME, "^a", arg);
+		return;
+	     end;
+next_arg:
+	end;
+
+	if npaths = 0 | npaths > 2
+	then do;
+	     call com_err_ (0, ME,
+		"Usage:  gzip input_file {output_file}^/{-byte8 | -dense9} {-level N}");
+	     return;
+	end;
+
+/* Given one pathname, the output is that name with .gz on the end, beside
+   the input.  The input is never deleted.			*/
+
+	if npaths = 1
+	then do;
+	     if length (rtrim (in_ent)) + 3 > 32
+	     then do;
+		call com_err_ (error_table_$bad_arg, ME,
+		     "^a.gz is longer than an entry name may be.^/Give the output pathname.",
+		     rtrim (in_ent));
+		return;
+	     end;
+	     out_dir = in_dir;
+	     out_ent = rtrim (in_ent) || ".gz";
+	end;
+
+	if ^force_sw then call confirm_overwrite;
+
+	chain = CHAIN (level);
+
+	call hcs_$initiate_count (in_dir, in_ent, "", in_bits, 0, in_ptr, code);
+	if in_ptr = null ()
+	then do;
+	     call com_err_ (code, ME, "Could not initiate ^a>^a", rtrim (in_dir),
+		rtrim (in_ent));
+	     return;
+	end;
+	in_len = divide (in_bits, 9, 24, 0);
+	in_words = divide (in_bits + 35, 36, 24, 0);
+
+/* The modification time.  A directory date is the clock with its low
+   sixteen bits dropped, so they go back as zeros; RFC 1952 counts seconds
+   from 1970 and the clock counts microseconds from 1901.  A date the
+   directory will not give up is written as zero, which RFC 1952 defines as
+   no time available.						*/
+
+	mtime = 0;
+	status_ptr = addr (sb_area);
+	call hcs_$status_ (in_dir, in_ent, 1, status_ptr, null (), scode);
+	if scode = 0
+	then do;
+	     unspec (clk) = (20)"0"b || status_branch.dtcm || (16)"0"b;
+	     if clk > EPOCH_1901
+	     then mtime = divide (clk - EPOCH_1901, 1000000, 35, 0);
+	end;
+
+/* Choose the derivation.  BYTE8 loses the ninth bit of every character and
+   a trailing run of fewer than nine bits; if neither exists it loses
+   nothing and compresses far better, so it is what automatic mode picks. */
+
+/* Whole words a word at a time, which is four times cheaper than a
+   character at a time; the characters past the last whole word singly,
+   since the word beyond the bit count holds nothing.		*/
+
+	high_bit = "0"b;
+	nfull = divide (in_bits, 36, 24, 0);
+	do k = 1 to nfull while (^high_bit);
+	     if bool (in_word (k), NINTH_BITS, AND) ^= (36)"0"b
+	     then high_bit = "1"b;
+	end;
+	do k = 4 * nfull + 1 to in_len;
+	     if rank (substr (in_buf, k, 1)) > 255 then high_bit = "1"b;
+	end;
+
+	if auto_sw
+	then dense9 = high_bit | (mod (in_bits, 9) ^= 0);
+	else if ^dense9
+	then do;
+	     if high_bit
+	     then call com_err_ (0, ME,
+		     "Warning: ^a has a ninth bit set;^/only the low eight bits of each byte are compressed.^/Use -dense9 to keep them.",
+		     rtrim (in_ent));
+	     if mod (in_bits, 9) ^= 0
+	     then call com_err_ (0, ME,
+		     "Warning: the bit count of ^a^/is not a multiple of nine, so its last ^d bit^[s^;^] are^/not compressed.  Use -dense9 to keep them.",
+		     rtrim (in_ent), mod (in_bits, 9), (mod (in_bits, 9) ^= 1));
+	end;
+
+	if dense9
+	then noct = 9 * divide (in_bits + 71, 72, 24, 0);
+	else noct = in_len;
+
+	if noct > MAX_OCT
+	then do;
+	     call com_err_ (error_table_$bad_arg, ME,
+		"^a is too large:  ^d octets to compress, and the limit^/is ^d.  See gzip.info.",
+		rtrim (in_ent), noct, MAX_OCT);
+	     goto cleanup;
+	end;
+
+	call get_temp_segments_ (ME, tsp, code);
+	if code ^= 0
+	then do;
+	     call com_err_ (code, ME, "Getting temporary segments.");
+	     goto cleanup;
+	end;
+	octp = tsp (1);
+	strmp = tsp (2);
+	headp = tsp (3);
+	prevp = addrel (tsp (3), HSIZE);
+
+	call build_tables;
+
+/* Derive the octets. */
+
+	if dense9
+	then do;
+	     call convert_dense9_$pack (in_ptr, in_bits, octp, MAX_OCT, t, code);
+	     if code ^= 0
+	     then do;
+		call com_err_ (code, ME, "Packing ^a.", rtrim (in_ent));
+		goto cleanup;
+	     end;
+	end;
+	else do;
+	     if in_len > 0
+	     then substr (oct, 1, in_len) = substr (in_buf, 1, in_len);
+	     if high_bit				/* forced -byte8; clear them */
+	     then do k = 1 to divide (in_len + 3, 4, 24, 0);
+		oct_word (k) = bool (oct_word (k), NINTH_BITS, AND_NOT);
+	     end;
+	end;
+
+	call hcs_$make_seg (out_dir, out_ent, "", RW_ACCESS, out_ptr, code);
+	if out_ptr = null ()
+	then do;
+	     call com_err_ (code, ME, "Could not create ^a>^a", rtrim (out_dir),
+		rtrim (out_ent));
+	     goto cleanup;
+	end;
+	call hcs_$truncate_seg (out_ptr, 0, code);
+	out_len = 0;
+
+	call put_header;
+	call deflate;
+	call put_trailer;
+
+	call hcs_$set_bc_seg (out_ptr, out_len * 9, code);
+	call hcs_$truncate_seg (out_ptr, divide (out_len + 3, 4, 24, 0), code);
+	call hcs_$terminate_noname (out_ptr, code);
+	out_ptr = null ();
+
+cleanup:
+	if tsp (1) ^= null () then call release_temp_segments_ (ME, tsp, code);
+	if in_ptr ^= null () then call hcs_$terminate_noname (in_ptr, code);
+	if out_ptr ^= null () then call hcs_$terminate_noname (out_ptr, code);
+	return;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/* confirm_overwrite -- ask before replacing an output segment that is
+   already there.  The question is asked before anything is read, so that a
+   refusal costs nothing, and -force skips it.  An exec_com can drive it
+   either way with the answer command.				*/
+
+confirm_overwrite:
+	proc;
+
+dcl  yes_sw bit (1);
+dcl  qcode fixed bin (35);
+dcl  cd fixed bin (35);
+
+	status_ptr = addr (sb_area);
+	call hcs_$status_ (out_dir, out_ent, 1, status_ptr, null (), cd);
+	if cd ^= 0 then return;			/* not there, or not ours to see */
+
+	qcode = 0;
+	call command_query_$yes_no (yes_sw, qcode, ME,
+	     "^a>^a already exists.  Answering yes truncates it and writes^/the new contents over it.  Answering no stops the command.",
+	     "Do you want to overwrite ^a>^a?", rtrim (out_dir), rtrim (out_ent));
+	if ^yes_sw then goto cleanup;
+
+     end confirm_overwrite;
+
+/* cv_level -- the value after -level.  Returns zero and reports if bad. */
+
+cv_level:
+	proc returns (fixed bin);
+
+dcl  v fixed bin;
+
+	if argl ^= 1
+	then goto bad_level;
+	v = index ("123456789", substr (arg, 1, 1));
+	if v = 0
+	then do;
+bad_level:
+	     call com_err_ (error_table_$bad_arg, ME,
+		"The level must be a digit from 1 to 9.  ^a", arg);
+	     return (0);
+	end;
+	return (v);
+
+     end cv_level;
+
+/* build_tables -- the bit reversal used to form octets from the stream, and
+   the CRC-32 table of RFC 1952.  Both are done with bit operations: there
+   is no shift operator in PL/I, and division is the most expensive
+   instruction on the machine.					*/
+
+build_tables:
+	proc;
+
+dcl (n, j) fixed bin;
+dcl  b bit (8) aligned;
+dcl  r bit (8) aligned;
+dcl  c bit (32) aligned;
+
+	do n = 0 to 255;
+	     b = substr (unspec (n), 29, 8);
+	     do j = 1 to 8;
+		substr (r, j, 1) = substr (b, 9 - j, 1);
+	     end;
+	     REV8 (n) = binary (r, 9);
+	end;
+
+	do n = 0 to 255;
+	     c = "0"b;
+	     substr (c, 25, 8) = substr (unspec (n), 29, 8);
+	     do j = 1 to 8;
+		if substr (c, 32, 1)
+		then c = bool ("0"b || substr (c, 1, 31), CRC_POLY, XOR);
+		else c = "0"b || substr (c, 1, 31);
+	     end;
+	     CRCTAB (n) = c;
+	end;
+
+     end build_tables;
+
+/* put_out -- one octet into the output segment, as the low eight bits of a
+   nine-bit character.						*/
+
+put_out:
+	proc (o);
+
+dcl  o fixed bin (24) parameter;
+
+	if out_len >= OUT_MAX
+	then do;
+	     call com_err_ (0, ME, "The output exceeds one segment.");
+	     goto cleanup;
+	end;
+	out_len = out_len + 1;
+	substr (out_seg, out_len, 1) = byte (o);
+
+     end put_out;
+
+/* put_le -- n octets of a value, least significant first. */
+
+put_le:
+	proc (v, n);
+
+dcl  v fixed bin (35) parameter;
+dcl  n fixed bin parameter;
+
+dcl  j fixed bin;
+
+	do j = 1 to n;
+	     call put_out (binary (substr (unspec (v), 37 - 8 * j, 8), 9));
+	end;
+
+     end put_le;
+
+/* put_header -- the gzip member header of RFC 1952.  The bit count, which
+   no field of the format has a place for, goes in the stored file name.
+
+   An extra field would be the tidier home for it, and the first version of
+   this program put it in one.  It was taken out again: Apple's gzip locates
+   the stored name without honouring the extra field's length, so a member
+   carrying both arrives on macOS with a name of one newline character.  The
+   extra field is therefore not merely ignored by other people's tools but
+   harmful to the field that those tools do propagate.  gunzip here still
+   reads a subfield if it finds one.				*/
+
+put_header:
+	proc;
+
+dcl  j fixed bin (21);
+
+	if dense9
+	then call ioa_$rsnnl ("^a.^d.dense9", fname, fname_len, rtrim (in_ent),
+		in_bits);
+	else call ioa_$rsnnl ("^a", fname, fname_len, rtrim (in_ent));
+
+	call put_out (31);				/* ID1 */
+	call put_out (139);				/* ID2 */
+	call put_out (8);				/* CM = deflate */
+	call put_out (8);				/* FLG = FNAME */
+	call put_le (mtime, 4);				/* MTIME */
+	call put_out (0);				/* XFL */
+	call put_out (255);				/* OS: unknown */
+
+	do j = 1 to fname_len;
+	     call put_out (rank (substr (fname, j, 1)));
+	end;
+	call put_out (0);				/* the name is null ended */
+
+     end put_header;
+
+/* put_trailer -- CRC-32 of the octets that were compressed, then their
+   count, both least significant octet first.			*/
+
+put_trailer:
+	proc;
+
+dcl  j fixed bin (24);
+dcl  x fixed bin;
+dcl  o fixed bin (35);
+dcl  lv fixed bin (35);				/* put_le takes (35) */
+
+	crc = (32)"1"b;
+	do j = 1 to noct;
+	     o = rank (substr (oct, j, 1));
+	     x = binary (bool (substr (crc, 25, 8), substr (unspec (o), 29, 8),
+		XOR), 9);
+	     crc = bool (CRCTAB (x), (8)"0"b || substr (crc, 1, 24), XOR);
+	end;
+	crc = bool (crc, (32)"1"b, XOR);
+
+	do j = 4 to 1 by -1;
+	     call put_out (binary (substr (crc, 8 * j - 7, 8), 9));
+	end;
+	lv = noct;
+	call put_le (lv, 4);
+
+     end put_trailer;
+
+/* put_code -- a Huffman code into the stream.  RFC 1951 sends these most
+   significant bit first, which is the order the bits already lie in, so the
+   code goes in as one string move.				*/
+
+put_code:
+	proc (c, n);
+
+dcl  c fixed bin (24) parameter;
+dcl  n fixed bin parameter;
+
+	substr (strm, bp + 1, n) = substr (unspec (c), 37 - n, n);
+	bp = bp + n;
+
+     end put_code;
+
+/* put_lsb -- everything that is not a Huffman code.  RFC 1951 sends these
+   least significant bit first, so they go in a bit at a time.	*/
+
+put_lsb:
+	proc (v, n);
+
+dcl  v fixed bin (24) parameter;
+dcl  n fixed bin parameter;
+
+dcl  j fixed bin;
+
+	do j = 1 to n;
+	     substr (strm, bp + j, 1) = substr (unspec (v), 37 - j, 1);
+	end;
+	bp = bp + n;
+
+     end put_lsb;
+
+/* fixed_lit -- the literal or length code of the fixed table, RFC 1951
+   section 3.2.6, and its length.  The table is regular enough to compute. */
+
+fixed_lit:
+	proc (sym, c, n);
+
+dcl  sym fixed bin (24) parameter;
+dcl  c fixed bin (24) parameter;
+dcl  n fixed bin parameter;
+
+	if sym < 144
+	then do; c = 48 + sym; n = 8; end;
+	else if sym < 256
+	then do; c = 400 + sym - 144; n = 9; end;
+	else if sym < 280
+	then do; c = sym - 256; n = 7; end;
+	else do; c = 192 + sym - 280; n = 8; end;
+
+     end fixed_lit;
+
+/* deflate -- one fixed-Huffman block over the whole input, with matches
+   found greedily.  If that is no smaller than the input, it is done again
+   as stored blocks.						*/
+
+deflate:
+	proc;
+
+dcl (i, j, m, h, best_len, best_dst, guard, limit, maxm) fixed bin (24);
+dcl (s, d, c, nblk) fixed bin (24);
+dcl  w fixed bin (35);				/* for the window mask */
+dcl  nb fixed bin;
+
+	bp = 0;
+	call put_lsb (1, 1);				/* BFINAL */
+	call put_lsb (1, 2);				/* BTYPE = fixed */
+
+	do h = 0 to HSIZE - 1;
+	     head (h) = 0;
+	end;
+	do h = 0 to WSIZE - 1;
+	     prev (h) = 0;
+	end;
+
+	i = 1;
+	do while (i <= noct);
+	     best_len = 0;
+	     best_dst = 0;
+
+	     if i + MINM - 1 <= noct
+	     then do;
+		h = hash (i);
+		j = head (h);
+		guard = chain;
+		limit = i - WSIZE;
+		maxm = min (MAXM, noct - i + 1);
+
+		do while (j > 0 & j > limit & guard > 0);
+		     guard = guard - 1;
+
+/* The character one past the best match so far must agree, or this
+   candidate cannot beat it.  That rejects most of the chain cheaply.  The
+   test is only reached while best_len is short of maxm, so neither index
+   can run past the end.					*/
+
+		     if best_len = 0
+		     then call extend;
+		     else if substr (oct, j + best_len, 1)
+			= substr (oct, i + best_len, 1)
+		     then call extend;
+		     if best_len >= maxm then goto chain_done;
+		     w = j;
+		     j = prev (binary (substr (unspec (w), 22, 15), 16));
+		end;
+chain_done:
+		w = i;
+		prev (binary (substr (unspec (w), 22, 15), 16)) = head (h);
+		head (h) = i;
+	     end;
+
+	     if best_len >= MINM
+	     then do;
+		s = len_code (best_len);
+		call fixed_lit (257 + s, c, nb);
+		call put_code (c, nb);
+		if LEN_EXTRA (s) > 0
+		then call put_lsb (best_len - LEN_BASE (s), LEN_EXTRA (s));
+		d = dst_code (best_dst);
+		call put_code (d, 5);
+		if DST_EXTRA (d) > 0
+		then call put_lsb (best_dst - DST_BASE (d), DST_EXTRA (d));
+
+/* The positions the match covered still have to enter the chains, or the
+   next match will not find them.				*/
+
+		do m = i + 1 to i + best_len - 1;
+		     if m + MINM - 1 <= noct
+		     then do;
+			h = hash (m);
+			w = m;
+			prev (binary (substr (unspec (w), 22, 15), 16))
+			     = head (h);
+			head (h) = m;
+		     end;
+		end;
+		i = i + best_len;
+	     end;
+
+	     else do;
+		call fixed_lit (rank (substr (oct, i, 1)), c, nb);
+		call put_code (c, nb);
+		i = i + 1;
+	     end;
+	end;
+
+	call fixed_lit (256, c, nb);			/* end of block */
+	call put_code (c, nb);
+
+/* Stored blocks cost the input plus five octets a block.  Use them only if
+   they really would be smaller, which for a very short input they are
+   not.								*/
+
+	nblk = divide (noct + 65534, 65535, 24, 0);
+	if nblk = 0 then nblk = 1;
+	if divide (bp + 7, 8, 24, 0) > noct + 5 * nblk
+	then call stored;
+
+	call flush_stream;
+	return;
+
+/* extend -- measure the match at j against the one at i, and keep it if it
+   is the longest yet.						*/
+
+extend:	proc;
+
+dcl  e fixed bin (24);
+
+	e = 0;
+	do while (e < maxm);
+	     if substr (oct, j + e, 1) ^= substr (oct, i + e, 1) then goto out;
+	     e = e + 1;
+	end;
+out:
+	if e > best_len
+	then do;
+	     best_len = e;
+	     best_dst = i - j;
+	end;
+
+     end extend;
+
+/* stored -- emit the input again as stored blocks, used when the coded form
+   came out no smaller.  The cost is five octets per block.	*/
+
+stored:	proc;
+
+dcl (p, take, fin) fixed bin (24);
+dcl  pad fixed bin;
+
+	bp = 0;
+	p = 1;
+	do while ("1"b);
+	     take = min (65535, noct - p + 1);
+	     if p + take > noct then fin = 1; else fin = 0;
+	     call put_lsb (fin, 1);
+	     call put_lsb (0, 2);
+	     pad = mod (8 - mod (bp, 8), 8);		/* align to an octet */
+	     if pad > 0
+	     then do;
+		substr (strm, bp + 1, pad) = (8)"0"b;
+		bp = bp + pad;
+	     end;
+	     call put_lsb (take, 16);
+	     call put_lsb (binary (bool (substr (unspec (take), 21, 16),
+		(16)"1"b, XOR), 17), 16);
+	     do m = p to p + take - 1;
+		call put_lsb (rank (substr (oct, m, 1)), 8);
+	     end;
+	     p = p + take;
+	     if fin = 1 then return;
+	end;
+
+     end stored;
+
+     end deflate;
+
+/* flush_stream -- the bit stream into octets.  RFC 1951 puts the first bit
+   sent in the least significant bit of the first octet, so each group of
+   eight is reversed on the way out.				*/
+
+flush_stream:
+	proc;
+
+dcl (k, m) fixed bin (24);
+
+	if bp = 0 then return;
+	substr (strm, bp + 1, 8) = (8)"0"b;		/* pad the last group */
+	m = divide (bp + 7, 8, 24, 0);
+	do k = 1 to m;
+	     call put_out (REV8 (binary (substr (strm, 8 * k - 7, 8), 9)));
+	end;
+
+     end flush_stream;
+
+/* hash -- three octets into fifteen bits.  The multipliers are odd so that
+   every bit of every octet reaches the result; the mask is a substr of the
+   low fifteen bits rather than a mod, since division is expensive and this
+   runs once per position.					*/
+
+hash:	proc (p) returns (fixed bin (24));
+
+dcl  p fixed bin (24) parameter;
+dcl  v fixed bin (35);
+
+	v = rank (substr (oct, p, 1)) * 2053 + rank (substr (oct, p + 1, 1)) * 97
+	     + rank (substr (oct, p + 2, 1));
+	return (binary (substr (unspec (v), 22, 15), 16));
+
+     end hash;
+
+/* len_code, dst_code -- the code for a match length or distance. */
+
+len_code:
+	proc (n) returns (fixed bin (24));
+
+dcl  n fixed bin (24) parameter;
+dcl  s fixed bin;
+
+	do s = 28 to 0 by -1;
+	     if n >= LEN_BASE (s) then return (s);
+	end;
+	return (0);
+
+     end len_code;
+
+dst_code:
+	proc (d) returns (fixed bin (24));
+
+dcl  d fixed bin (24) parameter;
+dcl  s fixed bin;
+
+	do s = 29 to 0 by -1;
+	     if d >= DST_BASE (s) then return (s);
+	end;
+	return (0);
+
+     end dst_code;
+
+%include status_structures;
+
+     end gzip;

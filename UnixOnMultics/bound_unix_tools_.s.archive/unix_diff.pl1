@@ -1,3 +1,9 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2026-09-22,Lippard), approve(2026-09-22,036):
+     Written.
+                                                   END HISTORY COMMENTS */
+
 /* unix_diff  old_file  new_file  {-output_file path | -of path}
  *
  * Companion to unix_patch.  Emits a unified diff of old_file
@@ -63,10 +69,16 @@ unix_diff:
                                      fixed bin(35));
    dcl release_temp_segments_ entry (char(*), (*) ptr,
                                      fixed bin(35));
+   dcl command_query_         entry options (variable);
+   dcl hcs_$delentry_file     entry (char(*), char(*),
+                                     fixed bin(35));
+
+   /* ---- error codes ---- */
+   dcl error_table_$namedup   fixed bin (35) ext static;
 
    /* ---- builtins ---- */
-   dcl (addrel, byte, divide, index, length, mod, null,
-        rank, rtrim, substr) builtin;
+   dcl (addr, addrel, byte, divide, index, length, mod,
+        null, rank, rtrim, substr) builtin;
 
    /* ---- resolved paths ---- */
    dcl (old_dir, new_dir, of_dir)    char (168);
@@ -422,10 +434,10 @@ unix_diff:
 
    /* ---- header lines (skipped by unix_patch, kept for Unix) ---- */
    call emit ("--- ");
-   call emit (rtrim (old_ent));
+   call emit_name (old_ent, old_comp);
    call emit (NL);
    call emit ("+++ ");
-   call emit (rtrim (new_ent));
+   call emit_name (new_ent, new_comp);
    call emit (NL);
 
    /* ---- walk the change blocks, coalescing near neighbours ---- */
@@ -759,10 +771,41 @@ emit:
    end emit;
 
 
-/* ---- Write the accumulated diff to the -output_file segment. */
+/* ---- Emit a file's display name: entry, or entry::component
+ *      for an archive component.
+ */
+emit_name:
+   proc (ent, comp);
+   dcl ent  char (*);
+   dcl comp char (*);
+
+   call emit (rtrim (ent));
+   if comp ^= "" then do;
+      call emit ("::");
+      call emit (rtrim (comp));
+   end;
+   end emit_name;
+
+
+/* ---- Write the accumulated diff to the -output_file segment.
+ *      If the segment already exists, ask before replacing it,
+ *      the way copy and the other commands do.
+ */
 flush_to_file:
    proc;
    dcl c2 fixed bin (35);
+   dcl answer char (8) varying;
+   dcl 1 qi aligned,
+         2 version                  fixed bin,
+         2 yes_or_no_sw             bit (1) unaligned,
+         2 suppress_name_sw         bit (1) unaligned,
+         2 cp_escape_control        bit (2) unaligned,
+         2 suppress_spacing         bit (1) unaligned,
+         2 literal_sw               bit (1) unaligned,
+         2 prompt_after_explanation bit (1) unaligned,
+         2 mbz                      bit (29) unaligned,
+         2 status_code              fixed bin (35),
+         2 query_code               fixed bin (35);
 
    call hcs_$make_seg (of_dir, of_ent, "", RW_ACCESS,
                        tgt_ptr, c2);
@@ -772,6 +815,40 @@ flush_to_file:
          rtrim (of_dir), rtrim (of_ent));
       go to cleanup;
    end;
+
+   if c2 = error_table_$namedup then do;
+      qi.version                  = 5;
+      qi.yes_or_no_sw             = "1"b;
+      qi.suppress_name_sw         = "0"b;
+      qi.cp_escape_control        = "00"b;
+      qi.suppress_spacing         = "0"b;
+      qi.literal_sw               = "0"b;
+      qi.prompt_after_explanation = "0"b;
+      qi.mbz                      = "0"b;
+      qi.status_code              = error_table_$namedup;
+      qi.query_code               = 0;
+      call command_query_ (addr (qi), answer, "unix_diff",
+         "Do you want to delete the old segment ^a>^a?",
+         rtrim (of_dir), rtrim (of_ent));
+      call hcs_$terminate_noname (tgt_ptr, c2);
+      if answer = "no" then go to cleanup;
+      call hcs_$delentry_file (of_dir, of_ent, c2);
+      if c2 ^= 0 then do;
+         call com_err_ (c2, "unix_diff",
+            "Could not delete the old segment ^a>^a",
+            rtrim (of_dir), rtrim (of_ent));
+         go to cleanup;
+      end;
+      call hcs_$make_seg (of_dir, of_ent, "", RW_ACCESS,
+                          tgt_ptr, c2);
+      if tgt_ptr = null () then do;
+         call com_err_ (c2, "unix_diff",
+            "Could not create output file ^a>^a",
+            rtrim (of_dir), rtrim (of_ent));
+         go to cleanup;
+      end;
+   end;
+
    call hcs_$truncate_seg (tgt_ptr, 0, c2);
    if out_len > 0 then
       substr (tgt_seg, 1, out_len)

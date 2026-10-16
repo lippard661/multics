@@ -1,0 +1,914 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2026-09-27,Lippard), approve(2026-09-27,AML038):
+     Written.
+  2) change(2026-10-06,Lippard), approve(2026-10-06,AML):	
+      Add overwrite protection and -force.
+                                                   END HISTORY COMMENTS */
+
+/* *********************************************************
+   *					         *
+   * gunzip -- expand a gzip file back into a segment      *
+   *					         *
+   ********************************************************* */
+
+/* Written:	27 September 2026 by Claude Opus 5.0 at the direction
+		of Jim Lippard.					*/
+
+/* Reads a gzip file as defined by RFC 1952 holding a DEFLATE stream as
+   defined by RFC 1951, and writes the storage it came from.  All three
+   block types are understood, including dynamic Huffman, so files made by
+   gzip on any other system are read as readily as those made here.
+
+   The input is taken as one octet to a nine-bit character, which is how
+   gzip on this system writes it and how decode_base64 delivers it.
+
+   The bit count.  A gzip file records the length of what it holds in
+   octets, and Multics storage is measured in bits, so the two differ by as
+   much as 71 bits whenever the storage was packed nine octets to two words.
+   gzip records the derivation and the bit count in the stored file name,
+   as ENTRYNAME.BITS.dense9, that being the only header field other
+   systems' tools propagate.  An extra subfield identified MU is also read
+   if one is present, since it is the tidier place for such a thing and
+   something else may write one; gzip here does not, because Apple's gzip
+   locates the stored name without honouring the extra field's length and
+   so loses the name whenever an extra field is there at all.
+
+   Failing both, the file is taken as a stream of octets and the segment is
+   given nine times as many bits, which is the right reading of any gzip
+   file made elsewhere.
+
+   Huffman decoding follows the counts-and-symbols method of the reference
+   decoder published with RFC 1951: one bit at a time, with two small
+   arrays per table and no lookup table to build.  It is slower per symbol
+   than a table-driven decoder and very much shorter, and the work here is
+   dominated by the copying rather than the decoding.			*/
+
+/* format: style2 */
+
+gunzip:	proc options (main);
+
+/* Entries */
+
+dcl  hcs_$initiate_count entry (char (*), char (*), char (*), fixed bin (24),
+	fixed bin (2), ptr, fixed bin (35));
+dcl  hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr,
+	fixed bin (35));
+dcl  hcs_$set_bc_seg entry (ptr, fixed bin (24), fixed bin (35));
+dcl  hcs_$truncate_seg entry (ptr, fixed bin (24), fixed bin (35));
+dcl  hcs_$terminate_noname entry (ptr, fixed bin (35));
+dcl  hcs_$status_ entry (char (*), char (*), fixed bin (1), ptr, ptr,
+	fixed bin (35));
+dcl  cu_$arg_count entry (fixed bin, fixed bin (35));
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+dcl  expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+dcl  get_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+dcl  release_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+dcl  convert_dense9_$unpack entry (ptr, fixed bin (24), ptr, fixed bin (24),
+	fixed bin (35));
+dcl  cv_dec_check_ entry (char (*), fixed bin (35)) returns (fixed bin (35));
+dcl  com_err_ entry () options (variable);
+dcl  command_query_$yes_no entry () options (variable);
+
+dcl  error_table_$bad_arg fixed bin (35) ext static;
+dcl  error_table_$badopt fixed bin (35) ext static;
+dcl  error_table_$too_many_args fixed bin (35) ext static;
+
+/* Builtins */
+
+dcl (addr, binary, bool, byte, divide, length, min, mod, null, rank, rtrim,
+	substr, unspec) builtin;
+
+/* Constants */
+
+dcl  ME char (6) int static options (constant) init ("gunzip");
+
+dcl  STRM_BITS fixed bin (24) int static options (constant) init (8388608);
+dcl  MAX_OUT fixed bin (24) int static options (constant) init (1044480);
+dcl  IN_MAX fixed bin (24) int static options (constant) init (1044480);
+dcl  RW_ACCESS fixed bin (5) int static options (constant) init (01010b);
+dcl  MAXBITS fixed bin int static options (constant) init (15);
+
+dcl  XOR bit (4) aligned int static options (constant) init ("0110"b);
+dcl  CRC_POLY bit (32) aligned int static options (constant)
+	init ("11101101101110001000001100100000"b);	/* edb88320 */
+
+dcl  LEN_BASE (0:28) fixed bin int static options (constant)
+	init (3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35,
+	43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258);
+dcl  LEN_EXTRA (0:28) fixed bin int static options (constant)
+	init (0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+	4, 4, 4, 4, 5, 5, 5, 5, 0);
+dcl  DST_BASE (0:29) fixed bin (24) int static options (constant)
+	init (1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+	257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193,
+	12289, 16385, 24577);
+dcl  DST_EXTRA (0:29) fixed bin int static options (constant)
+	init (0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+	9, 9, 10, 10, 11, 11, 12, 12, 13, 13);
+
+/* The order in which the code-length code lengths are sent, RFC 1951
+   section 3.2.7.						*/
+
+dcl  CLEN_ORDER (0:18) fixed bin int static options (constant)
+	init (16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14,
+	1, 15);
+
+dcl  POW2 (0:16) fixed bin (24) int static options (constant)
+	init (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+	8192, 16384, 32768, 65536);
+
+/* Automatic */
+
+dcl (in_dir, out_dir) char (168);
+dcl (in_ent, out_ent, gz_ent) char (32);
+dcl (got_out, force_sw) bit (1) aligned;
+dcl (nargs, argno, npaths) fixed bin;
+dcl  sb_area (20) fixed bin (35) aligned;		/* for hcs_$status_ */
+dcl (in_ptr, out_ptr) ptr;
+dcl  in_bits fixed bin (24);
+dcl  in_len fixed bin (24);				/* input octets */
+
+dcl  argp ptr;
+dcl  argl fixed bin (21);
+dcl  arg char (argl) based (argp);
+dcl  code fixed bin (35);
+
+dcl  tsp (2) ptr;
+dcl  strmp ptr;
+dcl  outp ptr;
+
+dcl  hx fixed bin (24);				/* header scan position */
+dcl  ip fixed bin (24);				/* bits consumed */
+dcl  nstrm fixed bin (24);				/* bits available */
+dcl  nout fixed bin (24);				/* octets produced */
+dcl  nbits fixed bin (24);				/* bits of storage */
+dcl  dense9 bit (1) aligned;
+dcl  got_mu bit (1) aligned;
+dcl (flg, xlen, si1, si2, slen, sver) fixed bin;
+dcl (i, t, u) fixed bin (24);
+dcl  fname char (128);
+dcl  fname_len fixed bin;
+dcl  crc bit (32) aligned;
+dcl  want_crc bit (32) aligned;
+dcl  want_size fixed bin (35);
+
+dcl  REV8 (0:255) fixed bin (24);
+dcl  CRCTAB (0:255) bit (32) aligned;
+dcl  lens (0:319) fixed bin;
+dcl  clen (0:18) fixed bin;
+
+/* The Huffman tables, in the counts-and-symbols form.  huff is declared
+   first because the three that follow are declared like it.	*/
+
+dcl  1 huff aligned based,
+       2 count (0:15) fixed bin,
+       2 symbol (0:319) fixed bin;
+
+dcl  1 lit aligned like huff;
+dcl  1 dst aligned like huff;
+dcl  1 cls aligned like huff;
+
+/* Based */
+
+dcl  in_buf char (in_len) based (in_ptr);
+dcl  strm bit (STRM_BITS) aligned based (strmp);
+dcl  outo char (MAX_OUT) based (outp);
+dcl  out_seg char (MAX_OUT) based (out_ptr);
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+	in_ptr = null ();
+	out_ptr = null ();
+	tsp (*) = null ();
+
+	got_out = "0"b;
+	force_sw = "0"b;
+	npaths = 0;
+
+	call cu_$arg_count (nargs, code);
+
+	do argno = 1 to nargs;
+	     call cu_$arg_ptr (argno, argp, argl, code);
+	     if argl > 0
+	     then if substr (arg, 1, 1) = "-"
+		then do;
+		     if arg = "-force" | arg = "-fc"
+		     then force_sw = "1"b;
+		     else do;
+			call com_err_ (error_table_$badopt, ME, "^a", arg);
+			return;
+		     end;
+		     goto next_arg;
+		end;
+	     npaths = npaths + 1;
+	     if npaths = 1
+	     then call expand_pathname_ (arg, in_dir, in_ent, code);
+	     else if npaths = 2
+	     then do;
+		call expand_pathname_ (arg, out_dir, out_ent, code);
+		got_out = "1"b;
+	     end;
+	     else do;
+		call com_err_ (error_table_$too_many_args, ME, "^a", arg);
+		return;
+	     end;
+	     if code ^= 0
+	     then do;
+		call com_err_ (code, ME, "^a", arg);
+		return;
+	     end;
+next_arg:
+	end;
+
+	if npaths = 0 then goto usage;
+
+/* The input may be named with or without its .gz, the name as given being
+   tried first so that an explicit name always wins.		*/
+
+	call hcs_$initiate_count (in_dir, in_ent, "", in_bits, 0, in_ptr, code);
+	if in_ptr = null ()
+	then if length (rtrim (in_ent)) + 3 <= 32
+	     then do;
+		gz_ent = rtrim (in_ent) || ".gz";
+		call hcs_$initiate_count (in_dir, gz_ent, "", in_bits, 0,
+		     in_ptr, code);
+		if in_ptr ^= null () then in_ent = gz_ent;
+	     end;
+	if in_ptr = null ()
+	then do;
+	     call com_err_ (code, ME, "Could not initiate ^a>^a", rtrim (in_dir),
+		rtrim (in_ent));
+	     return;
+	end;
+	in_len = divide (in_bits, 9, 24, 0);
+
+/* Without an output pathname, the input's name less its .gz, beside the
+   input.  The stored name is not used for this: under DENSE9 it carries the
+   bit count, and ENTRYNAME.BITS.dense9 is not what anyone wants a segment
+   called.							*/
+
+	if ^got_out
+	then do;
+	     t = length (rtrim (in_ent));
+	     if t > 3
+	     then if substr (in_ent, t - 2, 3) = ".gz"
+		then do;
+		     out_dir = in_dir;
+		     out_ent = substr (in_ent, 1, t - 3);
+		     got_out = "1"b;
+		end;
+	     if ^got_out
+	     then do;
+		call com_err_ (error_table_$bad_arg, ME,
+		     "^a does not end .gz, so the output name cannot be^/derived.  Give an output pathname.",
+		     rtrim (in_ent));
+		goto cleanup;
+	     end;
+	end;
+
+	if ^force_sw then call confirm_overwrite;
+
+	if in_len < 18					/* header plus trailer */
+	then do;
+	     call com_err_ (error_table_$bad_arg, ME,
+		"^a is too short to be a gzip file.", rtrim (in_ent));
+	     goto cleanup;
+	end;
+	if in_len > IN_MAX
+	then do;
+	     call com_err_ (error_table_$bad_arg, ME,
+		"^a is larger than this program can read.", rtrim (in_ent));
+	     goto cleanup;
+	end;
+
+	call get_temp_segments_ (ME, tsp, code);
+	if code ^= 0
+	then do;
+	     call com_err_ (code, ME, "Getting temporary segments.");
+	     goto cleanup;
+	end;
+	strmp = tsp (1);
+	outp = tsp (2);
+
+	call build_tables;
+	call read_header;
+	if hx < 0 then goto cleanup;
+
+/* The deflate stream runs from the end of the header to the last eight
+   octets, which are the trailer.  Turn it into a bit string: the first bit
+   sent is the least significant bit of the first octet, so each octet is
+   reversed on the way in.					*/
+
+	t = in_len - 8;				/* last octet of the stream */
+	if hx > t
+	then do;
+	     call com_err_ (error_table_$bad_arg, ME,
+		"^a holds no compressed data.", rtrim (in_ent));
+	     goto cleanup;
+	end;
+	do i = hx to t;
+	     u = REV8 (rank (substr (in_buf, i, 1)));
+	     substr (strm, 8 * (i - hx) + 1, 8) = substr (unspec (u), 29, 8);
+	end;
+	nstrm = 8 * (t - hx + 1);
+
+	ip = 0;
+	nout = 0;
+	call inflate;
+
+/* The bit count, from the subfield if it survived, else from the stored
+   name, else nine bits to the octet as for any gzip file from elsewhere. */
+
+	if ^got_mu then call read_name_count;
+	if ^got_mu
+	then do;
+	     dense9 = "0"b;
+	     nbits = 9 * nout;
+	end;
+
+	call check_trailer;
+
+	call hcs_$make_seg (out_dir, out_ent, "", RW_ACCESS, out_ptr, code);
+	if out_ptr = null ()
+	then do;
+	     call com_err_ (code, ME, "Could not create ^a>^a", rtrim (out_dir),
+		rtrim (out_ent));
+	     goto cleanup;
+	end;
+	call hcs_$truncate_seg (out_ptr, 0, code);
+
+	if dense9
+	then do;
+	     if nout ^= 9 * divide (nbits + 71, 72, 24, 0)
+	     then do;
+		call com_err_ (error_table_$bad_arg, ME,
+		     "A bit count of ^d calls for ^d octets and the file^/expanded to ^d.",
+		     nbits, 9 * divide (nbits + 71, 72, 24, 0), nout);
+		goto cleanup;
+	     end;
+	     call convert_dense9_$unpack (outp, nout, out_ptr, nbits, code);
+	     if code ^= 0
+	     then do;
+		call com_err_ (code, ME, "Unpacking the octets.");
+		goto cleanup;
+	     end;
+	end;
+	else do;
+	     if nout > 0 then substr (out_seg, 1, nout) = substr (outo, 1, nout);
+	     nbits = 9 * nout;
+	end;
+
+	call hcs_$set_bc_seg (out_ptr, nbits, code);
+	call hcs_$truncate_seg (out_ptr, divide (nbits + 35, 36, 24, 0), code);
+	call hcs_$terminate_noname (out_ptr, code);
+	out_ptr = null ();
+	goto cleanup;
+
+usage:
+	call com_err_ (0, ME, "Usage:  gunzip input_file {output_file} {-force}");
+	return;
+
+data_error:
+	call com_err_ (error_table_$bad_arg, ME,
+	     "^a is not a valid deflate stream.", rtrim (in_ent));
+
+cleanup:
+	if tsp (1) ^= null () then call release_temp_segments_ (ME, tsp, code);
+	if in_ptr ^= null () then call hcs_$terminate_noname (in_ptr, code);
+	if out_ptr ^= null () then call hcs_$terminate_noname (out_ptr, code);
+	return;
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/* confirm_overwrite -- ask before replacing an output segment that is
+   already there.  -force skips it, and an exec_com can drive it either way
+   with the answer command.					*/
+
+confirm_overwrite:
+	proc;
+
+dcl  yes_sw bit (1);
+dcl  qcode fixed bin (35);
+dcl  cd fixed bin (35);
+
+	status_ptr = addr (sb_area);
+	call hcs_$status_ (out_dir, out_ent, 1, status_ptr, null (), cd);
+	if cd ^= 0 then return;			/* not there, or not ours to see */
+
+	qcode = 0;
+	call command_query_$yes_no (yes_sw, qcode, ME,
+	     "^a>^a already exists.  Answering yes truncates it and writes^/the new contents over it.  Answering no stops the command.",
+	     "Do you want to overwrite ^a>^a?", rtrim (out_dir), rtrim (out_ent));
+	if ^yes_sw then goto cleanup;
+
+     end confirm_overwrite;
+
+/* get_in -- one octet of the input, by position. */
+
+get_in:	proc (p) returns (fixed bin);
+
+dcl  p fixed bin (24) parameter;
+
+	return (rank (substr (in_buf, p, 1)));
+
+     end get_in;
+
+/* build_tables -- the bit reversal and the CRC-32 table.  Both are done
+   with bit operations; there is no shift operator in PL/I and division is
+   the most expensive instruction on the machine.		*/
+
+build_tables:
+	proc;
+
+dcl (n, m) fixed bin;
+dcl (b, r) bit (8) aligned;
+dcl  c bit (32) aligned;
+
+	do n = 0 to 255;
+	     b = substr (unspec (n), 29, 8);
+	     do m = 1 to 8;
+		substr (r, m, 1) = substr (b, 9 - m, 1);
+	     end;
+	     REV8 (n) = binary (r, 9);
+	end;
+
+	do n = 0 to 255;
+	     c = "0"b;
+	     substr (c, 25, 8) = substr (unspec (n), 29, 8);
+	     do m = 1 to 8;
+		if substr (c, 32, 1)
+		then c = bool ("0"b || substr (c, 1, 31), CRC_POLY, XOR);
+		else c = "0"b || substr (c, 1, 31);
+	     end;
+	     CRCTAB (n) = c;
+	end;
+
+     end build_tables;
+
+/* read_header -- the gzip member header of RFC 1952.  Sets hx to the first
+   octet of the deflate stream, or to -1 after reporting.	*/
+
+read_header:
+	proc;
+
+dcl (n, sub_end) fixed bin (24);
+
+	got_mu = "0"b;
+	dense9 = "0"b;
+	nbits = 0;
+	fname_len = 0;
+
+	if get_in (1) ^= 31 | get_in (2) ^= 139
+	then do;
+	     call com_err_ (error_table_$bad_arg, ME,
+		"^a does not begin with the gzip identification.",
+		rtrim (in_ent));
+	     hx = -1;
+	     return;
+	end;
+	if get_in (3) ^= 8
+	then do;
+	     call com_err_ (error_table_$bad_arg, ME,
+		"^a uses compression method ^d, and only 8 (deflate) is^/understood.",
+		rtrim (in_ent), get_in (3));
+	     hx = -1;
+	     return;
+	end;
+
+	flg = get_in (4);
+	hx = 11;					/* past MTIME, XFL, OS */
+
+	if mod (divide (flg, 4, 17, 0), 2) = 1		/* FEXTRA */
+	then do;
+	     if hx + 1 > in_len then goto truncated;
+	     xlen = get_in (hx) + 256 * get_in (hx + 1);
+	     hx = hx + 2;
+	     sub_end = hx + xlen;
+	     if sub_end > in_len + 1 then goto truncated;
+	     do while (hx + 3 < sub_end);
+		si1 = get_in (hx);
+		si2 = get_in (hx + 1);
+		slen = get_in (hx + 2) + 256 * get_in (hx + 3);
+		if si1 = rank ("M") & si2 = rank ("U") & slen >= 6
+		then do;
+		     sver = get_in (hx + 4);
+		     if sver = 1
+		     then do;
+			dense9 = (get_in (hx + 5) = 1);
+			nbits = get_in (hx + 6) + 256 * get_in (hx + 7)
+			     + 65536 * get_in (hx + 8)
+			     + 16777216 * get_in (hx + 9);
+			got_mu = "1"b;
+		     end;
+		end;
+		hx = hx + 4 + slen;
+	     end;
+	     hx = sub_end;
+	end;
+
+	if mod (divide (flg, 8, 17, 0), 2) = 1		/* FNAME */
+	then do;
+	     n = 0;
+	     do while (hx <= in_len);
+		if get_in (hx) = 0 then goto name_done;
+		if n < 128
+		then do;
+		     n = n + 1;
+		     substr (fname, n, 1) = substr (in_buf, hx, 1);
+		end;
+		hx = hx + 1;
+	     end;
+	     goto truncated;
+name_done:
+	     hx = hx + 1;
+	     fname_len = n;
+	end;
+
+	if mod (divide (flg, 16, 17, 0), 2) = 1		/* FCOMMENT */
+	then do;
+	     do while (hx <= in_len);
+		if get_in (hx) = 0 then goto comment_done;
+		hx = hx + 1;
+	     end;
+	     goto truncated;
+comment_done:
+	     hx = hx + 1;
+	end;
+
+	if mod (divide (flg, 2, 17, 0), 2) = 1		/* FHCRC */
+	then hx = hx + 2;
+
+	if hx > in_len then goto truncated;
+	return;
+
+truncated:
+	call com_err_ (error_table_$bad_arg, ME,
+	     "The header of ^a runs off the end of the file.", rtrim (in_ent));
+	hx = -1;
+
+     end read_header;
+
+/* read_name_count -- the bit count from the stored name, for a file whose
+   extra field was lost to a tool that rewrote it.  The name ends
+   ".<bitcount>.dense9" when gzip on this system wrote it.	*/
+
+read_name_count:
+	proc;
+
+dcl (n, d) fixed bin;
+dcl  cd fixed bin (35);
+dcl  val fixed bin (35);
+
+	if fname_len < 10 then return;
+	if substr (fname, fname_len - 6, 7) ^= ".dense9" then return;
+	d = 0;
+	do n = fname_len - 7 to 1 by -1;
+	     if substr (fname, n, 1) = "."
+	     then do;
+		d = n;
+		goto found;
+	     end;
+	end;
+found:
+	if d = 0 then return;
+	if d >= fname_len - 7 then return;
+	val = cv_dec_check_ (substr (fname, d + 1, fname_len - 7 - d), cd);
+	if cd ^= 0 then return;
+	if val <= 0 then return;
+	dense9 = "1"b;
+	nbits = val;
+	got_mu = "1"b;
+
+     end read_name_count;
+
+/* check_trailer -- the CRC-32 and the octet count of RFC 1952. */
+
+check_trailer:
+	proc;
+
+dcl (n, x) fixed bin (24);
+dcl  o fixed bin (35);
+
+	crc = (32)"1"b;
+	do n = 1 to nout;
+	     o = rank (substr (outo, n, 1));
+	     x = binary (bool (substr (crc, 25, 8), substr (unspec (o), 29, 8),
+		XOR), 9);
+	     crc = bool (CRCTAB (x), (8)"0"b || substr (crc, 1, 24), XOR);
+	end;
+	crc = bool (crc, (32)"1"b, XOR);
+
+	want_crc = "0"b;
+	do n = 4 to 1 by -1;
+	     o = get_in (in_len - 8 + (5 - n));
+	     substr (want_crc, 8 * n - 7, 8) = substr (unspec (o), 29, 8);
+	end;
+	want_size = get_in (in_len - 3) + 256 * get_in (in_len - 2)
+	     + 65536 * get_in (in_len - 1) + 16777216 * get_in (in_len);
+
+	if crc ^= want_crc
+	then call com_err_ (0, ME,
+		"The check value of ^a does not match what was expanded.^/The output is written, but it is not what was compressed.",
+		rtrim (in_ent));
+	else if want_size ^= nout
+	then call com_err_ (0, ME,
+		"^a says it holds ^d octets and ^d were expanded.",
+		rtrim (in_ent), want_size, nout);
+
+     end check_trailer;
+
+/* get_bit, get_lsb -- the deflate bit stream.  Everything that is not a
+   Huffman code is sent least significant bit first.		*/
+
+get_bit:
+	proc returns (fixed bin);
+
+dcl  b fixed bin;
+
+	if ip >= nstrm then goto data_error;
+	if substr (strm, ip + 1, 1) then b = 1; else b = 0;
+	ip = ip + 1;
+	return (b);
+
+     end get_bit;
+
+get_lsb:
+	proc (n) returns (fixed bin (24));
+
+dcl  n fixed bin parameter;
+dcl (j, r) fixed bin (24);
+
+	if ip + n > nstrm then goto data_error;
+	r = 0;
+	do j = 1 to n;
+	     if substr (strm, ip + j, 1) then r = r + POW2 (j - 1);
+	end;
+	ip = ip + n;
+	return (r);
+
+     end get_lsb;
+
+/* build -- the counts-and-symbols form of a canonical Huffman table, from
+   the code lengths in lens starting at base.			*/
+
+build:	proc (tp, base, nsym);
+
+dcl  tp ptr parameter;
+dcl (base, nsym) fixed bin parameter;
+
+dcl (s, l) fixed bin;
+dcl  offs (0:16) fixed bin;
+
+	do l = 0 to 15;
+	     tp -> huff.count (l) = 0;
+	end;
+	do s = 0 to nsym - 1;
+	     tp -> huff.count (lens (base + s)) = tp -> huff.count (lens (base + s)) + 1;
+	end;
+	offs (0) = 0;
+	offs (1) = 0;
+	do l = 1 to 15;
+	     offs (l + 1) = offs (l) + tp -> huff.count (l);
+	end;
+	do s = 0 to nsym - 1;
+	     if lens (base + s) ^= 0
+	     then do;
+		tp -> huff.symbol (offs (lens (base + s))) = s;
+		offs (lens (base + s)) = offs (lens (base + s)) + 1;
+	     end;
+	end;
+	tp -> huff.count (0) = 0;
+
+     end build;
+
+/* decode -- one symbol, a bit at a time.  The canonical codes of a given
+   length are consecutive, so a running comparison against the first code
+   of each length finds the symbol without any table beyond the counts. */
+
+decode:	proc (tp) returns (fixed bin);
+
+dcl  tp ptr parameter;
+dcl (cd, first, idx, l, cnt) fixed bin;
+
+	cd = 0;
+	first = 0;
+	idx = 0;
+	do l = 1 to MAXBITS;
+	     cd = cd + get_bit ();
+	     cnt = tp -> huff.count (l);
+	     if cd - cnt < first
+	     then return (tp -> huff.symbol (idx + cd - first));
+	     idx = idx + cnt;
+	     first = 2 * (first + cnt);
+	     cd = 2 * cd;
+	end;
+	goto data_error;
+
+     end decode;
+
+/* put_oct -- one octet of output. */
+
+put_oct:
+	proc (o);
+
+dcl  o fixed bin (24) parameter;
+
+	if nout >= MAX_OUT
+	then do;
+	     call com_err_ (0, ME, "The expanded data exceeds one segment.");
+	     goto cleanup;
+	end;
+	nout = nout + 1;
+	substr (outo, nout, 1) = byte (o);
+
+     end put_oct;
+
+/* inflate -- the block loop of RFC 1951 section 3.2.3. */
+
+inflate:
+	proc;
+
+dcl (final, btype) fixed bin;
+dcl (n, s, l, d, ln) fixed bin (24);
+
+	do while ("1"b);
+	     final = get_bit ();
+	     btype = get_lsb (2);
+
+	     if btype = 0
+	     then do;					/* stored */
+		ip = ip + mod (8 - mod (ip, 8), 8);
+		ln = get_lsb (16);
+		n = get_lsb (16);
+		if bool (substr (unspec (ln), 21, 16), (16)"1"b, XOR)
+		     ^= substr (unspec (n), 21, 16)
+		then goto data_error;
+		do n = 1 to ln;
+		     call put_oct (REV8 (binary (substr (strm, ip + 1, 8), 9)));
+		     ip = ip + 8;
+		end;
+	     end;
+
+	     else if btype = 1 | btype = 2
+	     then do;
+		if btype = 1
+		then call fixed_tables;
+		else call dynamic_tables;
+
+		do while ("1"b);
+		     s = decode (addr (lit));
+		     if s < 256
+		     then call put_oct (s);
+		     else if s = 256
+		     then goto block_done;
+		     else do;
+			s = s - 257;
+			if s > 28 then goto data_error;
+			l = LEN_BASE (s) + get_lsb (LEN_EXTRA (s));
+			d = decode (addr (dst));
+			if d > 29 then goto data_error;
+			d = DST_BASE (d) + get_lsb (DST_EXTRA (d));
+			if d > nout then goto data_error;
+			if nout + l > MAX_OUT
+			then do;
+			     call com_err_ (0, ME,
+				"The expanded data exceeds one segment.");
+			     goto cleanup;
+			end;
+
+/* A match that does not overlap what it copies is one string move; one
+   that does has to be copied a character at a time, since each character
+   it produces may be a source for a later one.			*/
+
+			if d >= l
+			then do;
+			     substr (outo, nout + 1, l) =
+				substr (outo, nout - d + 1, l);
+			     nout = nout + l;
+			end;
+			else do n = 1 to l;
+			     substr (outo, nout + 1, 1) =
+				substr (outo, nout - d + 1, 1);
+			     nout = nout + 1;
+			end;
+		     end;
+		end;
+block_done:
+	     end;
+
+	     else goto data_error;
+
+	     if final = 1 then return;
+	end;
+
+     end inflate;
+
+/* fixed_tables -- the predefined code lengths of RFC 1951 section 3.2.6. */
+
+fixed_tables:
+	proc;
+
+dcl  n fixed bin;
+
+	do n = 0 to 143;
+	     lens (n) = 8;
+	end;
+	do n = 144 to 255;
+	     lens (n) = 9;
+	end;
+	do n = 256 to 279;
+	     lens (n) = 7;
+	end;
+	do n = 280 to 287;
+	     lens (n) = 8;
+	end;
+	call build (addr (lit), 0, 288);
+	do n = 0 to 29;
+	     lens (288 + n) = 5;
+	end;
+	call build (addr (dst), 288, 30);
+
+     end fixed_tables;
+
+/* dynamic_tables -- the code lengths sent with the block, RFC 1951 section
+   3.2.7.  The lengths of the literal and distance codes are themselves
+   Huffman coded, with a third alphabet whose lengths are sent plainly in a
+   fixed order.							*/
+
+dynamic_tables:
+	proc;
+
+dcl (n, s, r, hlit, hdist, hclen, prevl) fixed bin (24);
+
+	hlit = get_lsb (5) + 257;
+	hdist = get_lsb (5) + 1;
+	hclen = get_lsb (4) + 4;
+	if hlit > 288 | hdist > 32 then goto data_error;
+
+	do n = 0 to 18;
+	     clen (n) = 0;
+	end;
+	do n = 0 to hclen - 1;
+	     clen (CLEN_ORDER (n)) = get_lsb (3);
+	end;
+	do n = 0 to 18;
+	     lens (n) = clen (n);
+	end;
+	call build (addr (cls), 0, 19);
+
+	n = 0;
+	do while (n < hlit + hdist);
+	     s = decode (addr (cls));
+	     if s < 16
+	     then do;
+		lens (n) = s;
+		n = n + 1;
+	     end;
+	     else do;
+		if s = 16
+		then do;
+		     if n = 0 then goto data_error;
+		     prevl = lens (n - 1);
+		     r = 3 + get_lsb (2);
+		end;
+		else if s = 17
+		then do;
+		     prevl = 0;
+		     r = 3 + get_lsb (3);
+		end;
+		else do;
+		     prevl = 0;
+		     r = 11 + get_lsb (7);
+		end;
+		if n + r > hlit + hdist then goto data_error;
+		do s = 1 to r;
+		     lens (n) = prevl;
+		     n = n + 1;
+		end;
+	     end;
+	end;
+
+/* The lengths arrived as hlit literal codes followed by hdist distance
+   codes; build wants the distance codes at 288, where a full literal
+   alphabet would have ended.  Since 288 is at or above hlit the move runs
+   downward, so no entry is overwritten before it is read.	*/
+
+	do s = hdist - 1 to 0 by -1;
+	     lens (288 + s) = lens (hlit + s);
+	end;
+	do s = hlit to 287;
+	     lens (s) = 0;
+	end;
+	do s = hdist to 31;
+	     lens (288 + s) = 0;
+	end;
+
+	call build (addr (lit), 0, 288);
+	call build (addr (dst), 288, 32);
+
+     end dynamic_tables;
+
+%include status_structures;
+
+     end gunzip;

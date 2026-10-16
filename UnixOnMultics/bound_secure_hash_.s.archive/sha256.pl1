@@ -1,3 +1,12 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2026-09-22,Lippard), approve(2026-09-22,AML035):
+     Written.
+  2) change(2026-09-25,Lippard), approve(2026-09-25,AML):
+     Updated warning when used without -dense9 on files with the 9th bit set to
+     match encode_base64.
+                                                   END HISTORY COMMENTS */
+
 /* **********************************************************
    *						*
    * sha256 -- command and active function for secure_hash_ *
@@ -30,6 +39,10 @@
 				  native binary.  No other system computes
 				  this value.
 	-brief, -bf		print the hash alone, without the pathname.
+	-check HASH, -ck HASH	compare the hash against HASH rather than
+				  printing it.  HASH is 64 hexadecimal digits
+				  in either case.  Exactly one value may be
+				  given with this control argument.
 
    The hash is printed as 64 lowercase hexadecimal digits, matching the
    convention of sha256sum and cksum -a sha256 elsewhere.  In command form
@@ -40,6 +53,14 @@
    A file whose ninth bits are not all zero still yields a digest, but a
    warning is printed on error_output: under -byte8 those bits did not reach
    the hash, so the value will not match a foreign copy of the file.
+
+   Under -check the command says so when the hashes agree, and -brief
+   suppresses that; a disagreement is always reported on error_output with
+   both values, so that a redirected output stream cannot hide it.  The
+   active function returns "true" or "false" instead of the digest, which is
+   the point of the control argument:
+
+	&if [sha256 -check ^a4e... my_file] &then &goto ok
 
    Control arguments apply to every value regardless of where they appear,
    so the argument list is read twice: once for the control arguments, once
@@ -53,6 +74,7 @@ sha256:	proc;
 
 dcl  af_sw bit (1) aligned;
 dcl  brief_sw bit (1) aligned;
+dcl  check_sw bit (1) aligned;
 dcl  skip_next bit (1) aligned;
 dcl  mode fixed bin;
 dcl (nargs, argno, nitems) fixed bin;
@@ -69,6 +91,9 @@ dcl  digest bit (256) aligned;
 dcl  dirname char (168);
 dcl  ename char (32);
 
+dcl  expected char (64);
+dcl  bad fixed bin;
+
 dcl  arg char (al) based (ap);
 dcl  str char (sl) based (sp);
 dcl  return_string char (ret_lth) varying based (retp);
@@ -76,6 +101,11 @@ dcl  return_string char (ret_lth) varying based (retp);
 /* Constants */
 
 dcl  ME char (6) int static options (constant) init ("sha256");
+
+dcl  HEX_DIGITS char (16) int static options (constant)
+	init ("0123456789abcdef");
+dcl  UPPER_AF char (6) int static options (constant) init ("ABCDEF");
+dcl  LOWER_AF char (6) int static options (constant) init ("abcdef");
 
 /* External */
 
@@ -95,6 +125,7 @@ dcl  secure_hash_$bit_to_hex entry (bit (*) aligned, char (*),
 	fixed bin (35));
 
 dcl  error_table_$badopt fixed bin (35) ext static;
+dcl  error_table_$bad_arg fixed bin (35) ext static;
 dcl  error_table_$bad_conversion fixed bin (35) ext static;
 dcl  error_table_$noarg fixed bin (35) ext static;
 dcl  error_table_$not_act_fnc fixed bin (35) ext static;
@@ -102,7 +133,7 @@ dcl  error_table_$too_many_args fixed bin (35) ext static;
 
 /* Builtins */
 
-dcl (addr, length, substr) builtin;
+dcl (addr, length, substr, translate, verify) builtin;
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
@@ -137,6 +168,7 @@ sha:	entry;
 
 	mode = SHA_PACK_BYTE8;
 	brief_sw = "0"b;
+	check_sw = "0"b;
 	skip_next = "0"b;
 
 	do argno = 1 to nargs;
@@ -164,6 +196,37 @@ sha:	entry;
 		     return;
 		end;
 		skip_next = "1"b;			/* its value is not a path */
+	     end;
+	     else if arg = "-check" | arg = "-ck"
+	     then do;
+		if argno = nargs
+		then do;
+		     call error (error_table_$noarg, "After ^a.", arg);
+		     return;
+		end;
+		skip_next = "1"b;
+		call cu_$arg_ptr (argno + 1, sp, sl, code);
+
+/* A digest is 64 hexadecimal digits.  Accepting either case costs one
+   translate, and naming the offending character is more use to the caller
+   than a conversion code would be.				*/
+
+		if sl ^= 64
+		then do;
+		     call error (error_table_$bad_arg,
+			"A SHA-256 digest is 64 hexadecimal digits.^/^a", str);
+		     return;
+		end;
+		expected = translate (str, LOWER_AF, UPPER_AF);
+		bad = verify (expected, HEX_DIGITS);
+		if bad ^= 0
+		then do;
+		     call error (error_table_$bad_arg,
+			"The expected digest contains a character that is not^/hexadecimal:  ^a",
+			(substr (expected, bad, 1)));
+		     return;
+		end;
+		check_sw = "1"b;
 	     end;
 	     else if arg = "-byte8" | arg = "-b8"
 	     then mode = SHA_PACK_BYTE8;
@@ -196,6 +259,11 @@ next_control:
 	     if al > 0
 	     then if substr (arg, 1, 1) = "-"
 		then do;
+		     if arg = "-check" | arg = "-ck"
+		     then do;
+			skip_next = "1"b;		/* its value is not a path */
+			go to next_value;
+		     end;
 		     if arg = "-string" | arg = "-str"
 		     then do;
 			skip_next = "1"b;
@@ -231,12 +299,19 @@ count_item:
 	proc returns (bit (1) aligned);
 
 	nitems = nitems + 1;
-	if af_sw & nitems > 1
-	then do;
-	     call active_fnc_err_ (error_table_$too_many_args, ME,
-		"Only one value may be hashed by the active function.");
-	     return ("0"b);
-	end;
+	if nitems > 1
+	then if af_sw
+	     then do;
+		call active_fnc_err_ (error_table_$too_many_args, ME,
+		     "Only one value may be hashed by the active function.");
+		return ("0"b);
+	     end;
+	     else if check_sw
+	     then do;
+		call com_err_ (error_table_$too_many_args, ME,
+		     "Only one value may be compared with -check.");
+		return ("0"b);
+	     end;
 	return ("1"b);
 
      end count_item;
@@ -291,7 +366,7 @@ dcl  name char (*) parameter;
 	if code = error_table_$bad_conversion
 	then do;
 	     call com_err_ (0, ME,
-		"Warning: a ninth bit was set in ^a; the hash covers only^/the low eight bits of each byte.  Use -dense9 for native binary.",
+		"Warning: ^a has a ninth bit set;^/the hash covers only the low eight bits of each byte.^/Use -dense9 for native binary.",
 		name);
 	     return ("1"b);
 	end;
@@ -305,13 +380,48 @@ report:	proc (name);
 
 dcl  name char (*) parameter;
 
-	if af_sw
+	if check_sw
+	then call check_against (name);
+	else if af_sw
 	then return_string = hash;
 	else if brief_sw | length (name) = 0
 	then call ioa_ ("^a", hash);
 	else call ioa_ ("^a  ^a", hash, name);
 
      end report;
+
+/* check_against -- the -check comparison.  The active function yields a
+   truth value; the command says nothing when they agree unless asked, so
+   that checking a run of files produces output only where something is
+   wrong.							*/
+
+check_against:
+	proc (name);
+
+dcl  name char (*) parameter;
+
+	if hash = expected
+	then do;
+	     if af_sw
+	     then return_string = "true";
+	     else if ^brief_sw
+	     then if length (name) = 0
+		then call ioa_ ("The string matches.");
+		else call ioa_ ("^a matches.", name);
+	end;
+	else do;
+	     if af_sw
+	     then return_string = "false";
+	     else if length (name) = 0
+	     then call com_err_ (0, ME,
+		     "The string does not match.^/expected  ^a^/computed  ^a",
+		     expected, hash);
+	     else call com_err_ (0, ME,
+		     "^a does not match.^/expected  ^a^/computed  ^a", name,
+		     expected, hash);
+	end;
+
+     end check_against;
 
 error:	proc (cd, ctl, a1);
 

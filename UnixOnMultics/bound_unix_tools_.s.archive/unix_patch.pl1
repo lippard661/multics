@@ -1,3 +1,9 @@
+
+/****^  HISTORY COMMENTS:
+  1) change(2026-09-22,Lippard), approve(2026-09-22,036):
+     Written.
+                                                   END HISTORY COMMENTS */
+
 /* unix_patch  old_file  patch_file  {-output_file path | -of path}
  *
  * Applies one unified-diff patch (the kind produced by
