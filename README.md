@@ -22,6 +22,16 @@ Currently in MulticsOnUnix: abbrev.zsh (Multics abbrev for zsh; I'm
 currently using it on macOS), links to Archive::Multics and MBasic
 (and explore, in Multics Basic).
 
+The subdirectory multics-reverse-engineering contains guidance
+suitable for use with Claude for reverse engineering Multics bound
+objects to reconstruct lost PL/I source code, along with python tools
+you (or it) can use in such efforts. I've used it to successfully
+recover all of the tools I wrote for which I had executables but no
+source; in several cases I subsequently located the original source or
+the source from which I developed a derivative version, and the
+Claude-recovered source was fairly close (and produced equivalent but
+not identical executables).
+
 --
 
 The DPS8M simulator and information on installing it on various
