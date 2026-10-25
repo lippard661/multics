@@ -1,7 +1,11 @@
 
 /****^  HISTORY COMMENTS:
-  1) change(2026-09-22,Lippard), approve(2026-09-22,036):
+  1) change(2026-09-22,Lippard), approve(2026-09-22,AML036),
+     audit(2026-10-24,Swenson):
      Written.
+  2) change(2026-10-24,Lippard), approve(2026-10-24,AML046),
+     audit(2026-10-24,Swenson):
+     Prompt with command_query_ before overwriting an existing file.
                                                    END HISTORY COMMENTS */
 
 /* unix_diff  old_file  new_file  {-output_file path | -of path}
@@ -16,6 +20,9 @@
  * The old and new files may name archive components with the
  * usual  dir>arch.archive::component  syntax, and the new-file
  * argument (and -of) may use the equals convention (== or =).
+ *
+ * If -of names a segment that already exists, the command
+ * asks before replacing it; -force (-fc) skips the question.
  *
  * Method:  a real line-level diff.  Each line is fingerprinted,
  * then Myers' O(ND) algorithm finds a shortest edit script --
@@ -69,12 +76,9 @@ unix_diff:
                                      fixed bin(35));
    dcl release_temp_segments_ entry (char(*), (*) ptr,
                                      fixed bin(35));
-   dcl command_query_         entry options (variable);
-   dcl hcs_$delentry_file     entry (char(*), char(*),
-                                     fixed bin(35));
-
-   /* ---- error codes ---- */
-   dcl error_table_$namedup   fixed bin (35) ext static;
+   dcl command_query_$yes_no  entry options (variable);
+   dcl hcs_$status_ entry (char(*), char(*), fixed bin(1), ptr, ptr,
+                           fixed bin(35));
 
    /* ---- builtins ---- */
    dcl (addr, addrel, byte, divide, index, length, mod,
@@ -160,8 +164,10 @@ unix_diff:
                              init ("0123456789");
    dcl NO_NL char (27) int static options (constant)
                              init ("\ No newline at end of file");
-   dcl USAGE char (45) int static options (constant)
-      init ("Usage: unix_diff old_file new_file {-of path}");
+   dcl USAGE char (50) int static options (constant)
+      init ("Usage: unix_diff old_file new_file {-control_args}");
+   dcl force_sw bit (1);
+   dcl sb_area (20) fixed bin (35) aligned;
    dcl NL char (1);
 
    /* ------------------------------------------------------- */
@@ -173,6 +179,7 @@ unix_diff:
    old_seen    = "0"b;
    new_seen    = "0"b;
    have_of     = "0"b;
+   force_sw    = "0"b;
 
    /* ---- parse the command line ---- */
    call cu_$arg_count (nargs, code);
@@ -202,6 +209,8 @@ unix_diff:
             call cu_$arg_ptr (i, of_argp, of_argl, code);
             have_of = "1"b;
          end;
+         else if arg_str = "-force" | arg_str = "-fc"
+              then force_sw = "1"b;
          else do;
             call com_err_ (0, "unix_diff",
                "Unknown control argument ^a.", arg_str);
@@ -281,6 +290,10 @@ unix_diff:
          of_ent = eq_name;
       end;
    end;
+
+   /* ---- if -of names an existing segment, ask now, before any
+    *      work is done ---- */
+   if have_of & ^force_sw then call confirm_overwrite;
 
    /* ---- scratch: output buffer + packed integer arrays ---- */
    call get_temp_segments_ ("unix_diff", temp_segs, code);
@@ -787,25 +800,13 @@ emit_name:
    end emit_name;
 
 
-/* ---- Write the accumulated diff to the -output_file segment.
- *      If the segment already exists, ask before replacing it,
- *      the way copy and the other commands do.
+/* ---- Write the accumulated result to the -output_file
+ *      segment.  Any question about replacing it was asked
+ *      before the work began, in confirm_overwrite.
  */
 flush_to_file:
    proc;
    dcl c2 fixed bin (35);
-   dcl answer char (8) varying;
-   dcl 1 qi aligned,
-         2 version                  fixed bin,
-         2 yes_or_no_sw             bit (1) unaligned,
-         2 suppress_name_sw         bit (1) unaligned,
-         2 cp_escape_control        bit (2) unaligned,
-         2 suppress_spacing         bit (1) unaligned,
-         2 literal_sw               bit (1) unaligned,
-         2 prompt_after_explanation bit (1) unaligned,
-         2 mbz                      bit (29) unaligned,
-         2 status_code              fixed bin (35),
-         2 query_code               fixed bin (35);
 
    call hcs_$make_seg (of_dir, of_ent, "", RW_ACCESS,
                        tgt_ptr, c2);
@@ -815,40 +816,6 @@ flush_to_file:
          rtrim (of_dir), rtrim (of_ent));
       go to cleanup;
    end;
-
-   if c2 = error_table_$namedup then do;
-      qi.version                  = 5;
-      qi.yes_or_no_sw             = "1"b;
-      qi.suppress_name_sw         = "0"b;
-      qi.cp_escape_control        = "00"b;
-      qi.suppress_spacing         = "0"b;
-      qi.literal_sw               = "0"b;
-      qi.prompt_after_explanation = "0"b;
-      qi.mbz                      = "0"b;
-      qi.status_code              = error_table_$namedup;
-      qi.query_code               = 0;
-      call command_query_ (addr (qi), answer, "unix_diff",
-         "Do you want to delete the old segment ^a>^a?",
-         rtrim (of_dir), rtrim (of_ent));
-      call hcs_$terminate_noname (tgt_ptr, c2);
-      if answer = "no" then go to cleanup;
-      call hcs_$delentry_file (of_dir, of_ent, c2);
-      if c2 ^= 0 then do;
-         call com_err_ (c2, "unix_diff",
-            "Could not delete the old segment ^a>^a",
-            rtrim (of_dir), rtrim (of_ent));
-         go to cleanup;
-      end;
-      call hcs_$make_seg (of_dir, of_ent, "", RW_ACCESS,
-                          tgt_ptr, c2);
-      if tgt_ptr = null () then do;
-         call com_err_ (c2, "unix_diff",
-            "Could not create output file ^a>^a",
-            rtrim (of_dir), rtrim (of_ent));
-         go to cleanup;
-      end;
-   end;
-
    call hcs_$truncate_seg (tgt_ptr, 0, c2);
    if out_len > 0 then
       substr (tgt_seg, 1, out_len)
@@ -858,6 +825,33 @@ flush_to_file:
                            divide (out_len + 3, 4, 24, 0), c2);
    call hcs_$terminate_noname (tgt_ptr, c2);
    end flush_to_file;
+
+
+/* ---- Ask before replacing an -output_file segment that is
+ *      already there.  The question comes before any work is
+ *      done, so a refusal costs nothing.  -force skips it, and
+ *      an exec_com can drive it either way with the answer
+ *      command.
+ */
+confirm_overwrite:
+   proc;
+   dcl yes_sw bit (1);
+   dcl qcode  fixed bin (35);
+   dcl cd     fixed bin (35);
+
+   status_ptr = addr (sb_area);
+   call hcs_$status_ (of_dir, of_ent, 1, status_ptr, null (), cd);
+   /* not there, or not ours to see */
+   if cd ^= 0 then return;
+   qcode = 0;
+   call command_query_$yes_no (yes_sw, qcode, "unix_diff",
+      "^a>^a already exists.  Answering yes truncates it and"
+      || " writes^/the new diff over it.  Answering no stops"
+      || " the command.",
+      "Do you want to overwrite ^a>^a?",
+      rtrim (of_dir), rtrim (of_ent));
+   if ^yes_sw then go to cleanup;
+   end confirm_overwrite;
 
 
 /* ---- Print the accumulated diff on standard output. ---- */
@@ -874,5 +868,7 @@ flush_to_terminal:
       o = o + seglen;
    end;
    end flush_to_terminal;
+
+%include status_structures;
 
 end unix_diff;
